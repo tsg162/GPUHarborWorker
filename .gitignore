@@ -13,3 +13,4 @@ venv/
 *.log
 *.pid
 tls/
+node_modules/

@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GPUHarbor Dashboard</title>
+  <link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>GPUHarbor</h1>
+      <div class="header-meta">
+        <span id="hostname" class="badge badge-info">--</span>
+        <span id="version" class="dim">v--</span>
+        <span id="uptime" class="dim">--</span>
+        <span id="connection-status" class="badge badge-error">disconnected</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- System Overview -->
+    <section id="system-section">
+      <h2>System</h2>
+      <div class="stat-row">
+        <div class="stat-card">
+          <div class="stat-label">CPU Cores</div>
+          <div class="stat-value" id="cpu-count">--</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">RAM</div>
+          <div class="stat-value" id="ram-value">--</div>
+          <div class="bar-container">
+            <div class="bar" id="ram-bar"></div>
+          </div>
+          <div class="stat-detail" id="ram-detail"></div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Disk Free</div>
+          <div class="stat-value" id="disk-value">--</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-label">Jobs</div>
+          <div class="stat-value"><span id="jobs-running">0</span> / <span id="jobs-max">--</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- GPU Cards -->
+    <section id="gpu-section">
+      <h2>GPUs</h2>
+      <div id="gpu-cards" class="gpu-grid">
+        <div class="empty-state">Waiting for data...</div>
+      </div>
+    </section>
+
+    <!-- Jobs -->
+    <section id="jobs-section">
+      <h2>Jobs</h2>
+      <div id="jobs-list" class="jobs-container">
+        <div class="empty-state">No jobs</div>
+      </div>
+    </section>
+
+    <!-- Log Viewer (hidden until a job is selected) -->
+    <section id="log-section" class="hidden">
+      <div class="log-header">
+        <h2>Logs: <span id="log-job-id">--</span></h2>
+        <button id="log-close" class="btn btn-sm">Close</button>
+      </div>
+      <div id="log-viewer" class="log-viewer"></div>
+    </section>
+  </main>
+
+  <script src="/js/app.js"></script>
+</body>
+</html>

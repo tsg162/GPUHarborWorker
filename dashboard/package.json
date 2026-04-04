@@ -1,0 +1,12 @@
+{
+  "name": "gpuharbor-dashboard",
+  "version": "0.1.0",
+  "description": "GPU instance monitoring dashboard for GPUHarbor Worker",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
