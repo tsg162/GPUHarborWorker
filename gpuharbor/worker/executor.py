@@ -1,16 +1,19 @@
-"""Docker-based job execution engine with local filesystem storage."""
+"""Direct process-based job execution engine with local filesystem storage.
+
+Runs training commands as subprocesses directly on the host — no Docker.
+This is the right approach for Vast.ai / Runpod where the instance already
+has CUDA, PyTorch, etc. installed.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import signal
 from pathlib import Path
-
-import docker
-from docker.errors import DockerException, ImageNotFound, NotFound
-from docker.models.containers import Container
+from typing import AsyncIterator
 
 from gpuharbor.common.job_spec import JobSpec
 from gpuharbor.common.states import JobState
@@ -19,14 +22,9 @@ from gpuharbor.worker.state import JobStore
 
 logger = logging.getLogger(__name__)
 
-CONTAINER_WORKSPACE = "/workspace"
-CONTAINER_INPUT_DIR = f"{CONTAINER_WORKSPACE}/input"
-CONTAINER_OUTPUT_DIR = f"{CONTAINER_WORKSPACE}/output"
-CONTAINER_CHECKPOINT_DIR = f"{CONTAINER_WORKSPACE}/checkpoints"
-
 
 class JobExecutor:
-    """Manages Docker-based job execution lifecycle with local storage."""
+    """Manages direct subprocess job execution with local storage."""
 
     def __init__(
         self,
@@ -38,20 +36,13 @@ class JobExecutor:
         self._store = job_store
         self._grace_period = default_grace_period
 
-        # Track running containers for cancel support
-        self._running: dict[str, Container] = {}
+        # Track running processes for cancel support
+        self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
         self._log_queues: dict[str, asyncio.Queue] = {}
 
-        try:
-            self._docker = docker.from_env()
-            self._docker.ping()
-        except DockerException:
-            logger.error("Docker is not available. Job execution will fail.")
-            self._docker = None
-
     async def execute_job(self, job_id: str, spec: JobSpec) -> None:
-        """Full job execution pipeline: prepare workspace -> run container -> record outputs.
+        """Full job execution: prepare workspace -> run process -> record outputs.
 
         Designed to be run as an asyncio task.
         """
@@ -62,7 +53,7 @@ class JobExecutor:
         try:
             self._validate_resources(spec)
             await self._prepare_workspace(job_id, spec)
-            await self._run_container(job_id, spec, cancel_event)
+            await self._run_process(job_id, spec, cancel_event)
             self._record_output_artifacts(job_id)
             self._store.update_state(job_id, JobState.COMPLETED)
             logger.info("Job %s completed successfully", job_id)
@@ -80,7 +71,7 @@ class JobExecutor:
             except (ValueError, KeyError):
                 logger.error("Could not update job %s state to FAILED", job_id)
         finally:
-            self._running.pop(job_id, None)
+            self._processes.pop(job_id, None)
             self._cancel_events.pop(job_id, None)
             # Signal end of logs
             if job_id in self._log_queues:
@@ -88,10 +79,7 @@ class JobExecutor:
 
     def _validate_resources(self, spec: JobSpec) -> None:
         """Check that the server can satisfy the job's resource requirements."""
-        if self._docker is None:
-            raise RuntimeError("Docker is not available on this server")
-
-        from gpuharbor.worker.gpu import get_gpu_info, get_system_info
+        from gpuharbor.worker.gpu import get_gpu_info
 
         gpus = get_gpu_info()
         if spec.resources.gpu_count > len(gpus):
@@ -112,20 +100,17 @@ class JobExecutor:
         self._store.update_state(job_id, JobState.UPLOADING_INPUTS)
         self._storage.ensure_job_dirs(job_id)
 
-        # If an input checkpoint was specified, copy it from uploads/ into job input/
+        # Copy input checkpoint from uploads/ into job input/
         if spec.artifacts.input_checkpoint:
             filename = spec.artifacts.input_checkpoint
-            # Check uploads/ directory first, then absolute path
             src = self._storage.get_file(f"uploads/{filename}")
             if src is None:
-                # Maybe it was already placed in the job's input dir
                 src = self._storage.get_file(f"jobs/{job_id}/input/{filename}")
             if src is None:
                 raise FileNotFoundError(
                     f"Input checkpoint '{filename}' not found. "
                     f"Upload it first via POST /v1/upload"
                 )
-            # Copy to job input dir if not already there
             dest = self._storage.job_input_dir(job_id) / filename
             if not dest.exists():
                 shutil.copy2(src, dest)
@@ -137,127 +122,76 @@ class JobExecutor:
                 compute_sha256(dest),
             )
 
-    async def _run_container(
+    async def _run_process(
         self,
         job_id: str,
         spec: JobSpec,
         cancel_event: asyncio.Event,
     ) -> None:
-        """Pull image, create and start container, stream logs until exit."""
+        """Spawn the command as a subprocess and stream its output."""
         self._store.update_state(job_id, JobState.RUNNING)
-        loop = asyncio.get_event_loop()
 
-        # Pull image
-        logger.info("Pulling image %s for job %s", spec.container_image, job_id)
-        try:
-            await loop.run_in_executor(
-                None, self._docker.images.pull, spec.container_image
-            )
-        except ImageNotFound:
-            raise RuntimeError(f"Docker image not found: {spec.container_image}")
-
-        # Build container config
         job_dir = self._storage.job_dir(job_id)
-        env = dict(spec.env)
+
+        # Build environment: inherit host env + job spec env + gpuharbor vars
+        env = dict(os.environ)
+        env.update(spec.env)
         env["GPUHARBOR_JOB_ID"] = job_id
+        env["GPUHARBOR_INPUT_DIR"] = str(job_dir / "input")
+        env["GPUHARBOR_OUTPUT_DIR"] = str(job_dir / "output")
+        env["GPUHARBOR_CHECKPOINT_DIR"] = str(job_dir / "checkpoints")
 
-        volumes = {
-            str(job_dir / "input"): {"bind": CONTAINER_INPUT_DIR, "mode": "ro"},
-            str(job_dir / "output"): {"bind": CONTAINER_OUTPUT_DIR, "mode": "rw"},
-            str(job_dir / "checkpoints"): {"bind": CONTAINER_CHECKPOINT_DIR, "mode": "rw"},
-        }
+        # Restrict visible GPUs if the job requests fewer than available
+        from gpuharbor.worker.gpu import get_gpu_count
+        total_gpus = get_gpu_count()
+        if 0 < spec.resources.gpu_count < total_gpus:
+            # Give the job the first N GPUs (simple allocation)
+            visible = ",".join(str(i) for i in range(spec.resources.gpu_count))
+            env["CUDA_VISIBLE_DEVICES"] = visible
 
-        # GPU device request
-        device_requests = []
-        if spec.resources.gpu_count > 0:
-            device_requests.append(
-                docker.types.DeviceRequest(
-                    count=spec.resources.gpu_count,
-                    capabilities=[["gpu"]],
-                )
-            )
+        cmd = spec.command
+        logger.info("Running job %s: %s", job_id, " ".join(cmd))
 
-        # Create and start container
-        container = await loop.run_in_executor(
-            None,
-            lambda: self._docker.containers.run(
-                spec.container_image,
-                command=spec.command,
-                environment=env,
-                volumes=volumes,
-                device_requests=device_requests if device_requests else None,
-                detach=True,
-                name=f"gpuharbor-{job_id}",
-                labels={"gpuharbor.job_id": job_id},
-                network_mode="bridge",
-                shm_size="8g",
-            ),
-        )
-
-        self._running[job_id] = container
-        self._store.update_container_id(job_id, container.id)
-        logger.info("Started container %s for job %s", container.short_id, job_id)
-
-        await self._monitor_container(job_id, container, cancel_event)
-
-    async def _monitor_container(
-        self,
-        job_id: str,
-        container: Container,
-        cancel_event: asyncio.Event,
-    ) -> None:
-        """Stream container logs and wait for exit, handling cancellation."""
-        loop = asyncio.get_event_loop()
-        log_task = asyncio.create_task(self._stream_logs(job_id, container))
-
-        try:
-            while True:
-                if cancel_event.is_set():
-                    await self._handle_cancel(job_id, container)
-                    return
-
-                try:
-                    status = await loop.run_in_executor(
-                        None, lambda: container.reload() or container.status
-                    )
-                except NotFound:
-                    raise RuntimeError("Container disappeared unexpectedly")
-
-                if status == "exited":
-                    exit_code = container.attrs.get("State", {}).get("ExitCode", -1)
-                    if exit_code != 0:
-                        tail_logs = container.logs(tail=20).decode("utf-8", errors="replace")
-                        raise RuntimeError(
-                            f"Container exited with code {exit_code}.\n"
-                            f"Last output:\n{tail_logs}"
-                        )
-                    return  # Success
-
-                await asyncio.sleep(2)
-        finally:
-            log_task.cancel()
-            try:
-                await log_task
-            except asyncio.CancelledError:
-                pass
-            try:
-                await loop.run_in_executor(None, lambda: container.remove(force=True))
-            except Exception:
-                pass
-
-    async def _stream_logs(self, job_id: str, container: Container) -> None:
-        """Stream container logs into the log queue and local log file."""
-        log_queue = self._log_queues.get(job_id)
         log_file = self._storage.job_log_file(job_id)
         log_file.parent.mkdir(parents=True, exist_ok=True)
 
-        try:
-            log_gen = container.logs(stream=True, follow=True, timestamps=True)
-            with open(log_file, "a") as f:
-                for chunk in log_gen:
-                    line = chunk.decode("utf-8", errors="replace").rstrip("\n")
-                    f.write(line + "\n")
+        # Start subprocess
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,  # merge stderr into stdout
+            env=env,
+            cwd=str(job_dir),
+        )
+
+        self._processes[job_id] = proc
+        self._store.update_container_id(job_id, str(proc.pid))
+        logger.info("Started process PID %d for job %s", proc.pid, job_id)
+
+        # Stream output
+        await self._stream_and_wait(job_id, proc, cancel_event, log_file)
+
+    async def _stream_and_wait(
+        self,
+        job_id: str,
+        proc: asyncio.subprocess.Process,
+        cancel_event: asyncio.Event,
+        log_file: Path,
+    ) -> None:
+        """Read stdout, write to log file + queue, handle cancellation."""
+        log_queue = self._log_queues.get(job_id)
+
+        async def _read_output():
+            with open(log_file, "ab") as f:
+                while True:
+                    line_bytes = await proc.stdout.readline()
+                    if not line_bytes:
+                        break
+                    # Write to log file
+                    f.write(line_bytes)
                     f.flush()
+                    # Push to live queue
+                    line = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
                     if log_queue:
                         try:
                             log_queue.put_nowait(line)
@@ -267,15 +201,58 @@ class JobExecutor:
                             except asyncio.QueueEmpty:
                                 pass
                             log_queue.put_nowait(line)
-                    await asyncio.sleep(0)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.exception("Error streaming logs for job %s", job_id)
 
-    async def _handle_cancel(self, job_id: str, container: Container) -> None:
-        """Gracefully cancel a running job."""
-        loop = asyncio.get_event_loop()
+        async def _watch_cancel():
+            while not cancel_event.is_set():
+                await asyncio.sleep(1)
+            # Cancel requested — send SIGTERM
+            await self._handle_cancel(job_id, proc)
+
+        read_task = asyncio.create_task(_read_output())
+        cancel_task = asyncio.create_task(_watch_cancel())
+
+        try:
+            # Wait for process to finish or cancel
+            await asyncio.wait(
+                [read_task, cancel_task],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # If cancel fired, read_task may still be running
+            if cancel_event.is_set():
+                read_task.cancel()
+                try:
+                    await read_task
+                except asyncio.CancelledError:
+                    pass
+                return  # cancel handler already set state
+
+            # Process finished normally — wait for it
+            await proc.wait()
+            cancel_task.cancel()
+
+            if proc.returncode != 0:
+                # Read last lines from log for error context
+                tail = ""
+                if log_file.exists():
+                    with open(log_file, "rb") as f:
+                        data = f.read()
+                        lines = data.decode("utf-8", errors="replace").splitlines()
+                        tail = "\n".join(lines[-20:])
+                raise RuntimeError(
+                    f"Process exited with code {proc.returncode}.\n"
+                    f"Last output:\n{tail}"
+                )
+
+        finally:
+            cancel_task.cancel()
+            try:
+                await cancel_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _handle_cancel(self, job_id: str, proc: asyncio.subprocess.Process) -> None:
+        """Gracefully cancel a running process."""
         logger.info("Cancelling job %s (grace period: %ds)", job_id, self._grace_period)
 
         try:
@@ -285,25 +262,22 @@ class JobExecutor:
 
         # SIGTERM first
         try:
-            await loop.run_in_executor(
-                None, lambda: container.kill(signal=signal.SIGTERM)
-            )
-        except Exception:
-            logger.warning("Could not send SIGTERM to container for job %s", job_id)
+            proc.send_signal(signal.SIGTERM)
+        except ProcessLookupError:
+            pass
 
-        # Wait for grace period, then force kill
+        # Wait for grace period
         try:
-            await loop.run_in_executor(
-                None, lambda: container.wait(timeout=self._grace_period)
-            )
-        except Exception:
-            logger.warning("Force-killing container for job %s", job_id)
+            await asyncio.wait_for(proc.wait(), timeout=self._grace_period)
+        except asyncio.TimeoutError:
+            # Force kill
+            logger.warning("Force-killing process for job %s", job_id)
             try:
-                await loop.run_in_executor(None, lambda: container.kill())
-            except Exception:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
                 pass
 
-        # Record whatever outputs were produced
         self._record_output_artifacts(job_id)
         self._store.update_state(job_id, JobState.CANCELED)
         logger.info("Job %s canceled", job_id)
@@ -315,7 +289,6 @@ class JobExecutor:
             for f in files:
                 abs_path = self._storage.job_dir(job_id) / f["path"]
                 sha = compute_sha256(abs_path) if abs_path.exists() else None
-                # Infer type from filename
                 artifact_type = default_type
                 name_lower = f["name"].lower()
                 if "log" in name_lower or name_lower.endswith((".log", ".txt")):
@@ -327,7 +300,6 @@ class JobExecutor:
                     job_id, artifact_type, f"jobs/{job_id}/{f['path']}", sha
                 )
 
-        # Record container log
         log_file = self._storage.job_log_file(job_id)
         if log_file.exists():
             self._store.add_artifact(
@@ -337,21 +309,17 @@ class JobExecutor:
             )
 
     async def cancel_job(self, job_id: str) -> bool:
-        """Request cancellation of a running job.
-
-        Returns True if cancel was initiated, False if job is not running.
-        """
+        """Request cancellation of a running job."""
         cancel_event = self._cancel_events.get(job_id)
         if cancel_event is None:
             return False
         cancel_event.set()
         return True
 
-    async def stream_logs(self, job_id: str):
-        """Yield log lines for a job. Blocks until new lines are available."""
+    async def stream_logs(self, job_id: str) -> AsyncIterator[str]:
+        """Yield log lines for a job."""
         queue = self._log_queues.get(job_id)
         if queue is None:
-            # Job might be finished; read from log file
             log_file = self._storage.job_log_file(job_id)
             if log_file.exists():
                 with open(log_file) as f:
@@ -366,6 +334,5 @@ class JobExecutor:
             yield line
 
     def get_log_file_path(self, job_id: str) -> Path | None:
-        """Return the path to the local log file if it exists."""
         log_file = self._storage.job_log_file(job_id)
         return log_file if log_file.exists() else None

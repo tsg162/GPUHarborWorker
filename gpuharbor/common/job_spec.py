@@ -49,7 +49,6 @@ class JobSpec(BaseModel):
     name: str = Field(..., min_length=1, max_length=256)
     project: str = Field(default="default", min_length=1, max_length=256)
 
-    container_image: str = Field(..., min_length=1)
     command: list[str] = Field(..., min_length=1)
     env: dict[str, str] = Field(default_factory=dict)
 

@@ -1,13 +1,10 @@
-"""Internal job health monitoring via container heartbeat checks."""
+"""Internal job health monitoring via process liveness checks."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
-
-import docker
-from docker.errors import DockerException, NotFound
+import os
 
 from gpuharbor.common.states import JobState, is_terminal
 from gpuharbor.worker.state import JobStore
@@ -16,10 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 class HeartbeatMonitor:
-    """Periodically checks that running job containers are still alive.
+    """Periodically checks that running job processes are still alive.
 
-    If a container has died without the executor noticing (e.g., OOM kill,
-    host-level kill), the monitor marks the job as FAILED.
+    If a process has died without the executor noticing (e.g., OOM kill),
+    the monitor marks the job as FAILED.
     """
 
     def __init__(
@@ -32,14 +29,7 @@ class HeartbeatMonitor:
         self._task: asyncio.Task | None = None
         self._running = False
 
-        try:
-            self._docker = docker.from_env()
-        except DockerException:
-            logger.warning("Docker not available for heartbeat monitoring")
-            self._docker = None
-
     def start(self) -> None:
-        """Start the heartbeat monitor background task."""
         if self._task and not self._task.done():
             return
         self._running = True
@@ -47,14 +37,12 @@ class HeartbeatMonitor:
         logger.info("Heartbeat monitor started (interval: %ds)", self._interval)
 
     def stop(self) -> None:
-        """Stop the heartbeat monitor."""
         self._running = False
         if self._task and not self._task.done():
             self._task.cancel()
         logger.info("Heartbeat monitor stopped")
 
     async def _check_loop(self) -> None:
-        """Main monitoring loop."""
         while self._running:
             try:
                 await self._check_all_jobs()
@@ -66,7 +54,7 @@ class HeartbeatMonitor:
             await asyncio.sleep(self._interval)
 
     async def _check_all_jobs(self) -> None:
-        """Check all non-terminal jobs that have a container ID."""
+        """Check all running jobs whose PID is recorded in container_id field."""
         running_ids = self._store.get_running_job_ids()
         if not running_ids:
             return
@@ -76,56 +64,26 @@ class HeartbeatMonitor:
             if not job:
                 continue
 
-            container_id = job.get("container_id")
-            if not container_id:
+            pid_str = job.get("container_id")
+            if not pid_str:
                 continue
 
-            await self._check_container(job_id, container_id)
+            try:
+                pid = int(pid_str)
+            except (ValueError, TypeError):
+                continue
 
-    async def _check_container(self, job_id: str, container_id: str) -> None:
-        """Check if a specific container is still running."""
-        if not self._docker:
-            return
+            await self._check_process(job_id, pid)
 
-        loop = asyncio.get_event_loop()
-
+    async def _check_process(self, job_id: str, pid: int) -> None:
+        """Check if a process is still alive by sending signal 0."""
         try:
-            container = await loop.run_in_executor(
-                None, self._docker.containers.get, container_id
-            )
-            status = container.status
-
-            if status == "exited":
-                exit_code = container.attrs.get("State", {}).get("ExitCode", -1)
-                if exit_code != 0:
-                    error_msg = (
-                        f"Container exited unexpectedly with code {exit_code} "
-                        f"(detected by heartbeat monitor)"
-                    )
-                    logger.warning("Job %s: %s", job_id, error_msg)
-                    try:
-                        self._store.update_state(
-                            job_id, JobState.FAILED, error_message=error_msg
-                        )
-                    except (ValueError, KeyError):
-                        pass
-                # If exit code is 0, the executor should handle completion
-
-            elif status in ("dead", "removing"):
-                error_msg = f"Container in unexpected state: {status}"
-                logger.warning("Job %s: %s", job_id, error_msg)
-                try:
-                    self._store.update_state(
-                        job_id, JobState.FAILED, error_message=error_msg
-                    )
-                except (ValueError, KeyError):
-                    pass
-
-        except NotFound:
-            # Container was removed; mark job as failed if still in running state
+            os.kill(pid, 0)  # Doesn't actually send a signal, just checks existence
+        except ProcessLookupError:
+            # Process is gone — mark job as failed if still in running state
             job = self._store.get_job(job_id)
             if job and not is_terminal(JobState(job["state"])):
-                error_msg = "Container not found (may have been removed externally)"
+                error_msg = f"Process {pid} not found (may have been killed by OOM or external signal)"
                 logger.warning("Job %s: %s", job_id, error_msg)
                 try:
                     self._store.update_state(
@@ -133,6 +91,6 @@ class HeartbeatMonitor:
                     )
                 except (ValueError, KeyError):
                     pass
-
-        except DockerException as e:
-            logger.warning("Docker error checking job %s: %s", job_id, e)
+        except PermissionError:
+            # Process exists but we can't signal it (different user) — it's alive
+            pass
