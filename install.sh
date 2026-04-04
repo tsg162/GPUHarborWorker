@@ -36,6 +36,10 @@ fatal()   { error "$@"; exit 1; }
 
 # ── Load .env if present ───────────────────────────────────────────────
 
+# Clear stale port config that may linger from a previous run's worker.env
+# so that only values explicitly set in .env (or auto-detected) are used.
+unset GPUHARBOR_PORT GPUHARBOR_EXTERNAL_PORT 2>/dev/null || true
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 if [[ -f "${SCRIPT_DIR}/.env" ]]; then
     info "Loading configuration from ${SCRIPT_DIR}/.env"
