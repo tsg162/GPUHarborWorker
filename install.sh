@@ -51,7 +51,7 @@ fi
 
 # ── Configuration defaults ─────────────────────────────────────────────
 
-GPUHARBOR_TLS="${GPUHARBOR_TLS:-auto}"
+GPUHARBOR_TLS="${GPUHARBOR_TLS:-none}"
 GPUHARBOR_MAX_CONCURRENT_JOBS="${GPUHARBOR_MAX_CONCURRENT_JOBS:-1}"
 GPUHARBOR_STORAGE_ROOT="${GPUHARBOR_STORAGE_ROOT:-/workspace/gpuharbor}"
 GPUHARBOR_LOG_LEVEL="${GPUHARBOR_LOG_LEVEL:-info}"
