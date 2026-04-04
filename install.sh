@@ -56,20 +56,36 @@ PYTHON_MIN_VERSION="3.10"
 
 # ── Auto-detect port (Vast.ai awareness) ───────────────────────────────
 
+port_is_free() {
+    ! ss -tlnp 2>/dev/null | grep -q ":${1} " && return 0
+    return 1
+}
+
 auto_detect_port() {
-    local preferred_ports=(5000 8443 8000 6006 1111)
+    # On Vast.ai, exposed ports are in VAST_TCP_PORT_* env vars.
+    # Try each mapped port, but only if it's actually free.
+    local preferred_ports=(5000 8443 8000 1111)
 
     for port in "${preferred_ports[@]}"; do
         local var="VAST_TCP_PORT_${port}"
-        if [[ -n "${!var:-}" ]]; then
+        if [[ -n "${!var:-}" ]] && port_is_free "$port"; then
             echo "$port"
             return
         fi
     done
 
+    # Fall back: any Vast.ai mapped port that's free
     for var in $(compgen -v VAST_TCP_PORT_ 2>/dev/null || true); do
         local port="${var#VAST_TCP_PORT_}"
-        if [[ "$port" =~ ^[0-9]+$ ]]; then
+        if [[ "$port" =~ ^[0-9]+$ ]] && port_is_free "$port"; then
+            echo "$port"
+            return
+        fi
+    done
+
+    # Last resort: find any free port from preferred list
+    for port in 5000 8443 8000 9000 7000; do
+        if port_is_free "$port"; then
             echo "$port"
             return
         fi
