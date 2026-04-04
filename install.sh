@@ -55,46 +55,59 @@ GPUHARBOR_LOG_LEVEL="${GPUHARBOR_LOG_LEVEL:-info}"
 PYTHON_MIN_VERSION="3.10"
 
 # ── Auto-detect port (Vast.ai awareness) ───────────────────────────────
+#
+# On Vast.ai, VAST_TCP_PORT_XXXX=YYYYY means:
+#   - XXXX = internal port the process should bind to
+#   - YYYYY = external port clients connect to from outside
+# We need both: bind to XXXX, advertise YYYYY in the connection URL.
 
 port_is_free() {
     ! ss -tlnp 2>/dev/null | grep -q ":${1} " && return 0
     return 1
 }
 
-auto_detect_port() {
-    # On Vast.ai, exposed ports are in VAST_TCP_PORT_* env vars.
-    # Try each mapped port, but only if it's actually free.
-    local preferred_ports=(5000 8443 8000 1111)
+# Sets GPUHARBOR_PORT (bind) and GPUHARBOR_EXTERNAL_PORT (advertise)
+detect_ports() {
+    local preferred=(5000 8443 8000 1111)
 
-    for port in "${preferred_ports[@]}"; do
-        local var="VAST_TCP_PORT_${port}"
-        if [[ -n "${!var:-}" ]] && port_is_free "$port"; then
-            echo "$port"
+    # Try preferred internal ports that have a Vast.ai mapping and are free
+    for internal in "${preferred[@]}"; do
+        local var="VAST_TCP_PORT_${internal}"
+        if [[ -n "${!var:-}" ]] && port_is_free "$internal"; then
+            GPUHARBOR_PORT="$internal"
+            GPUHARBOR_EXTERNAL_PORT="${!var}"
             return
         fi
     done
 
-    # Fall back: any Vast.ai mapped port that's free
+    # Try any Vast.ai mapped port that's free
     for var in $(compgen -v VAST_TCP_PORT_ 2>/dev/null || true); do
-        local port="${var#VAST_TCP_PORT_}"
-        if [[ "$port" =~ ^[0-9]+$ ]] && port_is_free "$port"; then
-            echo "$port"
+        local internal="${var#VAST_TCP_PORT_}"
+        if [[ "$internal" =~ ^[0-9]+$ ]] && port_is_free "$internal"; then
+            GPUHARBOR_PORT="$internal"
+            GPUHARBOR_EXTERNAL_PORT="${!var}"
             return
         fi
     done
 
-    # Last resort: find any free port from preferred list
+    # No Vast.ai — find a free port, external = internal
     for port in 5000 8443 8000 9000 7000; do
         if port_is_free "$port"; then
-            echo "$port"
+            GPUHARBOR_PORT="$port"
+            GPUHARBOR_EXTERNAL_PORT="$port"
             return
         fi
     done
 
-    echo "5000"
+    GPUHARBOR_PORT="5000"
+    GPUHARBOR_EXTERNAL_PORT="5000"
 }
 
-GPUHARBOR_PORT="${GPUHARBOR_PORT:-$(auto_detect_port)}"
+if [[ -z "${GPUHARBOR_PORT:-}" ]]; then
+    detect_ports
+else
+    GPUHARBOR_EXTERNAL_PORT="${GPUHARBOR_EXTERNAL_PORT:-$GPUHARBOR_PORT}"
+fi
 
 # ── Pre-flight checks ──────────────────────────────────────────────────
 
@@ -316,7 +329,7 @@ if [[ "$GPUHARBOR_TLS" == "none" ]]; then
     PROTOCOL="http"
 fi
 
-CONNECT_URL="${PROTOCOL}://${PUBLIC_IP}:${GPUHARBOR_PORT}"
+CONNECT_URL="${PROTOCOL}://${PUBLIC_IP}:${GPUHARBOR_EXTERNAL_PORT}"
 DISK_FREE=$(df -BG /workspace 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G' || df -BG / | awk 'NR==2 {print $4}' | tr -d 'G')
 GPU_FIRST_NAME=$(echo "$GPU_INFO" | head -1 | cut -d, -f1 | xargs)
 
