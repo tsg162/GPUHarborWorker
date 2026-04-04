@@ -38,7 +38,7 @@ AUTH_TOKEN = os.environ.get("GPUHARBOR_AUTH_TOKEN", "")
 MAX_CONCURRENT_JOBS = int(os.environ.get("GPUHARBOR_MAX_CONCURRENT_JOBS", "1"))
 DB_PATH = os.environ.get("GPUHARBOR_DB_PATH", "/workspace/gpuharbor/jobs.db")
 STORAGE_ROOT = Path(os.environ.get("GPUHARBOR_STORAGE_ROOT", "/workspace/gpuharbor"))
-PORT = int(os.environ.get("GPUHARBOR_PORT", "8443"))
+PORT = int(os.environ.get("GPUHARBOR_PORT", "5000"))
 TLS_CERT = os.environ.get("GPUHARBOR_TLS_CERT", "")
 TLS_KEY = os.environ.get("GPUHARBOR_TLS_KEY", "")
 

@@ -57,7 +57,7 @@ PYTHON_MIN_VERSION="3.10"
 # ── Auto-detect port (Vast.ai awareness) ───────────────────────────────
 
 auto_detect_port() {
-    local preferred_ports=(8443 5000 8080 8000 6006 1111)
+    local preferred_ports=(5000 8443 8000 6006 1111)
 
     for port in "${preferred_ports[@]}"; do
         local var="VAST_TCP_PORT_${port}"
@@ -75,7 +75,7 @@ auto_detect_port() {
         fi
     done
 
-    echo "8443"
+    echo "5000"
 }
 
 GPUHARBOR_PORT="${GPUHARBOR_PORT:-$(auto_detect_port)}"
