@@ -182,9 +182,24 @@ else
             ;;
     esac
 
-    $SUDO systemctl enable docker
-    $SUDO systemctl start docker
-    success "Docker installed and started"
+    # Start Docker — handle both systemd and non-systemd (Vast.ai containers)
+    if command -v systemctl &>/dev/null && systemctl --version &>/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+        $SUDO systemctl enable docker
+        $SUDO systemctl start docker
+    else
+        # No systemd (common in Vast.ai/Docker containers) — start dockerd directly
+        info "No systemd detected. Starting dockerd directly..."
+        if ! docker info &>/dev/null 2>&1; then
+            $SUDO dockerd &>/dev/null &
+            sleep 3
+        fi
+    fi
+
+    if docker info &>/dev/null 2>&1; then
+        success "Docker installed and started"
+    else
+        warn "Docker installed but could not start. It may already be available via host socket."
+    fi
 fi
 
 # Install NVIDIA Container Toolkit if needed
@@ -214,7 +229,15 @@ if ! docker info 2>/dev/null | grep -qi "nvidia"; then
     esac
 
     $SUDO nvidia-ctk runtime configure --runtime=docker 2>/dev/null || true
-    $SUDO systemctl restart docker 2>/dev/null || true
+    # Restart docker to pick up nvidia runtime
+    if [[ -d /run/systemd/system ]]; then
+        $SUDO systemctl restart docker 2>/dev/null || true
+    else
+        pkill dockerd 2>/dev/null || true
+        sleep 1
+        $SUDO dockerd &>/dev/null &
+        sleep 3
+    fi
     success "NVIDIA Container Toolkit installed"
 fi
 
