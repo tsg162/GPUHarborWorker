@@ -12,8 +12,8 @@
 #   cd GPUHarborWorker && ./install.sh
 #
 # Configuration (env vars or .env file):
-#   GPUHARBOR_PORT                 API port (auto-detected on Vast.ai, default: 8443)
-#   GPUHARBOR_TLS                  "auto" (self-signed), "none", or cert path prefix
+#   GPUHARBOR_PORT                 Internal bind port (auto-detected, default: 5000)
+#   GPUHARBOR_TLS                  "auto" (self-signed), "none" (default), or cert path prefix
 #   GPUHARBOR_MAX_CONCURRENT_JOBS  Max simultaneous jobs (default: 1)
 #   GPUHARBOR_STORAGE_ROOT         Storage root (default: /workspace/gpuharbor)
 
@@ -26,13 +26,15 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
 info()    { echo -e "${CYAN}[INFO]${NC} $*"; }
-success() { echo -e "${GREEN}[OK]${NC} $*"; }
+success() { echo -e "${GREEN}[ OK ]${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 fatal()   { error "$@"; exit 1; }
+debug()   { echo -e "${DIM}       $*${NC}"; }
 
 # ── Load .env if present ───────────────────────────────────────────────
 
@@ -61,9 +63,9 @@ PYTHON_MIN_VERSION="3.10"
 # ── Auto-detect port (Vast.ai awareness) ───────────────────────────────
 #
 # On Vast.ai, VAST_TCP_PORT_XXXX=YYYYY means:
-#   - XXXX = internal port the process should bind to
+#   - XXXX = internal port the process should BIND to
 #   - YYYYY = external port clients connect to from outside
-# We need both: bind to XXXX, advertise YYYYY in the connection URL.
+# We bind to XXXX internally and show YYYYY for the external URL.
 
 port_is_free() {
     ! ss -tlnp 2>/dev/null | grep -q ":${1} " && return 0
@@ -74,13 +76,36 @@ port_is_free() {
 detect_ports() {
     local preferred=(5000 8443 8000 1111)
 
+    # Detect if we're on Vast.ai
+    local vastai_detected=false
+    local vast_mappings=""
+    for var in $(compgen -v VAST_TCP_PORT_ 2>/dev/null || true); do
+        vastai_detected=true
+        local internal="${var#VAST_TCP_PORT_}"
+        if [[ "$internal" =~ ^[0-9]+$ ]]; then
+            vast_mappings="${vast_mappings}  ${internal} -> ${!var} (external)\n"
+        fi
+    done
+
+    if $vastai_detected; then
+        info "Vast.ai detected. Port mappings found:"
+        echo -e "$vast_mappings" | while IFS= read -r line; do
+            [[ -n "$line" ]] && debug "$line"
+        done
+    fi
+
     # Try preferred internal ports that have a Vast.ai mapping and are free
     for internal in "${preferred[@]}"; do
         local var="VAST_TCP_PORT_${internal}"
-        if [[ -n "${!var:-}" ]] && port_is_free "$internal"; then
-            GPUHARBOR_PORT="$internal"
-            GPUHARBOR_EXTERNAL_PORT="${!var}"
-            return
+        if [[ -n "${!var:-}" ]]; then
+            if port_is_free "$internal"; then
+                GPUHARBOR_PORT="$internal"
+                GPUHARBOR_EXTERNAL_PORT="${!var}"
+                info "Selected port ${internal} (internal) -> ${!var} (external)"
+                return
+            else
+                debug "Port ${internal} is in use, skipping"
+            fi
         fi
     done
 
@@ -90,6 +115,7 @@ detect_ports() {
         if [[ "$internal" =~ ^[0-9]+$ ]] && port_is_free "$internal"; then
             GPUHARBOR_PORT="$internal"
             GPUHARBOR_EXTERNAL_PORT="${!var}"
+            info "Selected port ${internal} (internal) -> ${!var} (external)"
             return
         fi
     done
@@ -99,22 +125,26 @@ detect_ports() {
         if port_is_free "$port"; then
             GPUHARBOR_PORT="$port"
             GPUHARBOR_EXTERNAL_PORT="$port"
+            info "Selected port ${port} (no Vast.ai port mapping found)"
             return
         fi
     done
 
     GPUHARBOR_PORT="5000"
     GPUHARBOR_EXTERNAL_PORT="5000"
+    warn "All preferred ports in use, defaulting to 5000"
 }
 
 if [[ -z "${GPUHARBOR_PORT:-}" ]]; then
     detect_ports
 else
     GPUHARBOR_EXTERNAL_PORT="${GPUHARBOR_EXTERNAL_PORT:-$GPUHARBOR_PORT}"
+    info "Using configured port: ${GPUHARBOR_PORT}"
 fi
 
 # ── Pre-flight checks ──────────────────────────────────────────────────
 
+echo ""
 info "Starting GPUHarbor worker installation..."
 echo ""
 
@@ -256,7 +286,7 @@ if [[ "$GPUHARBOR_TLS" == "auto" ]]; then
         success "Generated self-signed TLS certificate for ${PUBLIC_IP}"
     fi
 elif [[ "$GPUHARBOR_TLS" == "none" ]]; then
-    warn "TLS disabled. Communication will be unencrypted."
+    success "TLS disabled (use a tunnel for encryption)"
 else
     TLS_CERT_PATH="${GPUHARBOR_TLS}.crt"
     TLS_KEY_PATH="${GPUHARBOR_TLS}.key"
@@ -268,10 +298,15 @@ fi
 
 # ── Step 5: Start the worker ───────────────────────────────────────────
 
-info "Step 5/5: Starting worker..."
+info "Step 5/5: Starting worker on port ${GPUHARBOR_PORT}..."
 
 PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 HOSTNAME_LABEL=$(hostname -s 2>/dev/null || echo "gpuharbor-worker")
+
+PROTOCOL="http"
+if [[ "$GPUHARBOR_TLS" != "none" ]]; then
+    PROTOCOL="https"
+fi
 
 # Write environment file
 ENV_FILE="${GPUHARBOR_STORAGE_ROOT}/worker.env"
@@ -304,14 +339,54 @@ nohup "$WORKER_BIN" > "${GPUHARBOR_STORAGE_ROOT}/worker.log" 2>&1 &
 WORKER_PID=$!
 echo "$WORKER_PID" > "${GPUHARBOR_STORAGE_ROOT}/worker.pid"
 
-sleep 2
-if kill -0 "$WORKER_PID" 2>/dev/null; then
-    success "GPUHarbor worker started (PID: ${WORKER_PID})"
-else
-    error "Worker failed to start. Check log:"
-    tail -20 "${GPUHARBOR_STORAGE_ROOT}/worker.log" 2>/dev/null || true
+# ── Verify worker is running and healthy ──────────────────────────────
+
+info "Waiting for worker to start..."
+HEALTH_URL="${PROTOCOL}://localhost:${GPUHARBOR_PORT}/health"
+CURL_OPTS="-s --max-time 2"
+if [[ "$PROTOCOL" == "https" ]]; then
+    CURL_OPTS="$CURL_OPTS --insecure"
+fi
+
+HEALTHY=false
+for i in 1 2 3 4 5; do
+    sleep 1
+    if ! kill -0 "$WORKER_PID" 2>/dev/null; then
+        error "Worker process died (PID: ${WORKER_PID})"
+        echo ""
+        error "=== Worker log ==="
+        tail -30 "${GPUHARBOR_STORAGE_ROOT}/worker.log" 2>/dev/null || true
+        echo ""
+        error "=== Environment ==="
+        cat "$ENV_FILE"
+        exit 1
+    fi
+
+    HEALTH_RESPONSE=$(curl $CURL_OPTS "$HEALTH_URL" 2>/dev/null || true)
+    if echo "$HEALTH_RESPONSE" | grep -q '"status"' 2>/dev/null; then
+        HEALTHY=true
+        break
+    fi
+    debug "Attempt ${i}/5: waiting for ${HEALTH_URL} ..."
+done
+
+if ! $HEALTHY; then
+    error "Worker started (PID: ${WORKER_PID}) but health check failed after 5 attempts"
+    echo ""
+    error "Health URL tested: ${HEALTH_URL}"
+    error "=== Worker log ==="
+    tail -30 "${GPUHARBOR_STORAGE_ROOT}/worker.log" 2>/dev/null || true
+    echo ""
+    error "=== Environment ==="
+    cat "$ENV_FILE"
+    echo ""
+    error "=== Listening ports ==="
+    ss -tlnp 2>/dev/null | grep "$WORKER_PID" || ss -tlnp 2>/dev/null | head -20
     exit 1
 fi
+
+success "Worker started and healthy (PID: ${WORKER_PID})"
+debug "Health check response: ${HEALTH_RESPONSE}"
 
 # Write restart helper
 cat > "${GPUHARBOR_STORAGE_ROOT}/restart.sh" << 'RESTARTEOF'
@@ -328,36 +403,48 @@ chmod +x "${GPUHARBOR_STORAGE_ROOT}/restart.sh"
 
 # ── Print connection info ──────────────────────────────────────────────
 
-PROTOCOL="https"
-if [[ "$GPUHARBOR_TLS" == "none" ]]; then
-    PROTOCOL="http"
-fi
-
-CONNECT_URL="${PROTOCOL}://${PUBLIC_IP}:${GPUHARBOR_EXTERNAL_PORT}"
+DIRECT_URL="${PROTOCOL}://${PUBLIC_IP}:${GPUHARBOR_EXTERNAL_PORT}"
+LOCAL_URL="${PROTOCOL}://localhost:${GPUHARBOR_PORT}"
 DISK_FREE=$(df -BG /workspace 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G' || df -BG / | awk 'NR==2 {print $4}' | tr -d 'G')
 GPU_FIRST_NAME=$(echo "$GPU_INFO" | head -1 | cut -d, -f1 | xargs)
 
 echo ""
 echo -e "${BOLD}============================================${NC}"
 echo -e "${GREEN}  GPUHarbor worker ready!${NC}"
-echo ""
-echo -e "  URL:    ${BOLD}${CONNECT_URL}${NC}"
-echo -e "  Token:  ${BOLD}${AUTH_TOKEN}${NC}"
-echo -e "  GPU:    ${GPU_COUNT}x ${GPU_FIRST_NAME}"
-echo -e "  CUDA:   ${CUDA_VERSION}"
-echo -e "  Disk:   ${DISK_FREE}GB free"
-echo -e "  Store:  ${GPUHARBOR_STORAGE_ROOT}"
-echo ""
-echo -e "  Add to ${CYAN}~/.gpuharbor/servers.yaml${NC}:"
-echo ""
-echo -e "    ${YELLOW}servers:${NC}"
-echo -e "    ${YELLOW}  ${HOSTNAME_LABEL}:${NC}"
-echo -e "    ${YELLOW}    url: ${CONNECT_URL}${NC}"
-echo -e "    ${YELLOW}    token: ${AUTH_TOKEN}${NC}"
-echo -e "    ${YELLOW}    description: \"${GPU_COUNT}x ${GPU_FIRST_NAME}\"${NC}"
 echo -e "${BOLD}============================================${NC}"
 echo ""
-echo -e "Manage the worker:"
-echo -e "  ${CYAN}tail -f ${GPUHARBOR_STORAGE_ROOT}/worker.log${NC}"
-echo -e "  ${CYAN}bash ${GPUHARBOR_STORAGE_ROOT}/restart.sh${NC}"
+echo -e "  ${BOLD}Worker${NC}"
+echo -e "  Listening:  ${BOLD}${LOCAL_URL}${NC}  (bind port ${GPUHARBOR_PORT})"
+echo -e "  Direct URL: ${BOLD}${DIRECT_URL}${NC}  (external port ${GPUHARBOR_EXTERNAL_PORT})"
+echo -e "  Token:      ${BOLD}${AUTH_TOKEN}${NC}"
+echo ""
+echo -e "  ${BOLD}Hardware${NC}"
+echo -e "  GPU:   ${GPU_COUNT}x ${GPU_FIRST_NAME}"
+echo -e "  CUDA:  ${CUDA_VERSION}"
+echo -e "  Disk:  ${DISK_FREE}GB free"
+echo -e "  Store: ${GPUHARBOR_STORAGE_ROOT}"
+echo ""
+echo -e "${BOLD}──── Next Steps ────${NC}"
+echo ""
+echo -e "  ${BOLD}1.${NC} Create a Cloudflare tunnel to expose the worker:"
+echo ""
+echo -e "     ${CYAN}cloudflared tunnel --url ${LOCAL_URL}${NC}"
+echo ""
+echo -e "  ${BOLD}2.${NC} Add the tunnel URL to ${CYAN}~/.gpuharbor/servers.yaml${NC} on your laptop:"
+echo ""
+echo -e "     ${YELLOW}servers:${NC}"
+echo -e "     ${YELLOW}  my-gpu:${NC}"
+echo -e "     ${YELLOW}    url: https://<your-tunnel-url>.trycloudflare.com${NC}"
+echo -e "     ${YELLOW}    token: ${AUTH_TOKEN}${NC}"
+echo -e "     ${YELLOW}    description: \"${GPU_COUNT}x ${GPU_FIRST_NAME}\"${NC}"
+echo ""
+echo -e "  ${BOLD}3.${NC} Test from your laptop:"
+echo ""
+echo -e "     ${CYAN}gpuharbor servers info${NC}"
+echo ""
+echo -e "${BOLD}──── Management ────${NC}"
+echo ""
+echo -e "  Logs:    ${CYAN}tail -f ${GPUHARBOR_STORAGE_ROOT}/worker.log${NC}"
+echo -e "  Restart: ${CYAN}bash ${GPUHARBOR_STORAGE_ROOT}/restart.sh${NC}"
+echo -e "  Health:  ${CYAN}curl ${LOCAL_URL}/health${NC}"
 echo ""
