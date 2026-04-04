@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gpuharbor-worker"
+version = "0.1.0"
+description = "GPUHarbor worker agent — runs on GPU instances to accept and execute training jobs"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "sse-starlette>=1.6.0",
+    "python-multipart>=0.0.6",
+    "pydantic>=2.0.0",
+    "docker>=7.0.0",
+]
+
+[project.scripts]
+gpuharbor-worker = "gpuharbor.worker.api:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["gpuharbor"]
