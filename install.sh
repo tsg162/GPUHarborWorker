@@ -89,8 +89,11 @@ detect_ports() {
 
     if $vastai_detected; then
         info "Vast.ai detected. Port mappings found:"
-        echo -e "$vast_mappings" | while IFS= read -r line; do
-            [[ -n "$line" ]] && debug "$line"
+        for var in $(compgen -v VAST_TCP_PORT_ 2>/dev/null || true); do
+            local p="${var#VAST_TCP_PORT_}"
+            if [[ "$p" =~ ^[0-9]+$ ]]; then
+                debug "${p} -> ${!var} (external)"
+            fi
         done
     fi
 
@@ -98,7 +101,9 @@ detect_ports() {
     for internal in "${preferred[@]}"; do
         local var="VAST_TCP_PORT_${internal}"
         if [[ -n "${!var:-}" ]]; then
-            if port_is_free "$internal"; then
+            if [[ "$internal" -gt 65535 ]]; then
+                debug "Port ${internal} exceeds 65535, skipping"
+            elif port_is_free "$internal"; then
                 GPUHARBOR_PORT="$internal"
                 GPUHARBOR_EXTERNAL_PORT="${!var}"
                 info "Selected port ${internal} (internal) -> ${!var} (external)"
@@ -109,10 +114,10 @@ detect_ports() {
         fi
     done
 
-    # Try any Vast.ai mapped port that's free
+    # Try any Vast.ai mapped port that's free (skip invalid ports > 65535 and port 22)
     for var in $(compgen -v VAST_TCP_PORT_ 2>/dev/null || true); do
         local internal="${var#VAST_TCP_PORT_}"
-        if [[ "$internal" =~ ^[0-9]+$ ]] && port_is_free "$internal"; then
+        if [[ "$internal" =~ ^[0-9]+$ ]] && [[ "$internal" -le 65535 ]] && [[ "$internal" -ne 22 ]] && port_is_free "$internal"; then
             GPUHARBOR_PORT="$internal"
             GPUHARBOR_EXTERNAL_PORT="${!var}"
             info "Selected port ${internal} (internal) -> ${!var} (external)"
