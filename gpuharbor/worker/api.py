@@ -35,7 +35,6 @@ logger = logging.getLogger(__name__)
 
 SERVER_NAME = os.environ.get("GPUHARBOR_SERVER_NAME", "gpuharbor-worker")
 AUTH_TOKEN = os.environ.get("GPUHARBOR_AUTH_TOKEN", "")
-MAX_CONCURRENT_JOBS = int(os.environ.get("GPUHARBOR_MAX_CONCURRENT_JOBS", "1"))
 DB_PATH = os.environ.get("GPUHARBOR_DB_PATH", "/workspace/gpuharbor/jobs.db")
 STORAGE_ROOT = Path(os.environ.get("GPUHARBOR_STORAGE_ROOT", "/workspace/gpuharbor"))
 PORT = int(os.environ.get("GPUHARBOR_PORT", "5000"))
@@ -68,8 +67,8 @@ async def lifespan(app: FastAPI):
     _heartbeat.start()
 
     logger.info(
-        "GPUHarbor worker started: server=%s, max_jobs=%d, storage=%s, port=%d",
-        SERVER_NAME, MAX_CONCURRENT_JOBS, STORAGE_ROOT, PORT,
+        "GPUHarbor worker started: server=%s, storage=%s, port=%d",
+        SERVER_NAME, STORAGE_ROOT, PORT,
     )
 
     yield
@@ -110,7 +109,7 @@ async def get_status():
     """Return server state: GPUs, utilization, memory, jobs, disk."""
     running_jobs = _job_store.count_active_jobs() if _job_store else 0
     uptime = int(time.time() - _start_time) if _start_time else 0
-    status = get_full_status(SERVER_NAME, MAX_CONCURRENT_JOBS, running_jobs, uptime)
+    status = get_full_status(SERVER_NAME, running_jobs, uptime)
     # Add disk info from storage
     if _storage:
         status["disk_free_gb"] = _storage.disk_free_gb()
@@ -178,16 +177,6 @@ async def submit_job(req: SubmitJobRequest):
     """Submit a new job for execution."""
     if not _job_store or not _executor or not _checkpoint_mgr:
         raise HTTPException(status_code=503, detail="Worker not fully initialized")
-
-    # Check capacity
-    active = _job_store.count_active_jobs()
-    if active >= MAX_CONCURRENT_JOBS:
-        raise HTTPException(
-            status_code=429,
-            detail=f"Server at capacity: {active}/{MAX_CONCURRENT_JOBS} jobs running. "
-            f"Try again later or use a different server.",
-            headers={"Retry-After": "10"},
-        )
 
     # Validate input checkpoint exists if specified
     if req.spec.artifacts.input_checkpoint and _storage:

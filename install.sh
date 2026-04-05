@@ -14,7 +14,6 @@
 # Configuration (env vars or .env file):
 #   GPUHARBOR_PORT                 Internal bind port (auto-detected, default: 5000)
 #   GPUHARBOR_TLS                  "auto" (self-signed), "none" (default), or cert path prefix
-#   GPUHARBOR_MAX_CONCURRENT_JOBS  Max simultaneous jobs (default: 1)
 #   GPUHARBOR_STORAGE_ROOT         Storage root (default: /workspace/gpuharbor)
 
 set -euo pipefail
@@ -54,7 +53,6 @@ fi
 # ── Configuration defaults ─────────────────────────────────────────────
 
 GPUHARBOR_TLS="${GPUHARBOR_TLS:-none}"
-GPUHARBOR_MAX_CONCURRENT_JOBS="${GPUHARBOR_MAX_CONCURRENT_JOBS:-1}"
 GPUHARBOR_STORAGE_ROOT="${GPUHARBOR_STORAGE_ROOT:-/workspace/gpuharbor}"
 GPUHARBOR_LOG_LEVEL="${GPUHARBOR_LOG_LEVEL:-info}"
 
@@ -319,7 +317,6 @@ cat > "$ENV_FILE" << ENVEOF
 GPUHARBOR_SERVER_NAME=${HOSTNAME_LABEL}
 GPUHARBOR_AUTH_TOKEN=${AUTH_TOKEN}
 GPUHARBOR_PORT=${GPUHARBOR_PORT}
-GPUHARBOR_MAX_CONCURRENT_JOBS=${GPUHARBOR_MAX_CONCURRENT_JOBS}
 GPUHARBOR_DB_PATH=${GPUHARBOR_STORAGE_ROOT}/jobs.db
 GPUHARBOR_STORAGE_ROOT=${GPUHARBOR_STORAGE_ROOT}
 GPUHARBOR_LOG_LEVEL=${GPUHARBOR_LOG_LEVEL}

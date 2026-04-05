@@ -87,7 +87,6 @@ function renderStatus(data) {
   // System stats
   $("#cpu-count").textContent = data.cpu_count || "--";
   $("#jobs-running").textContent = data.running_jobs ?? 0;
-  $("#jobs-max").textContent = data.max_concurrent_jobs ?? "--";
 
   // RAM
   const ramTotal = data.ram_gb || 0;

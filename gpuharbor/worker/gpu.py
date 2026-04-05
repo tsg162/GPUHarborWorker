@@ -151,7 +151,7 @@ def _get_cpu_count() -> int:
     return os.cpu_count() or 1
 
 
-def get_full_status(server_name: str, max_concurrent_jobs: int, running_jobs: int, uptime_seconds: int) -> dict:
+def get_full_status(server_name: str, running_jobs: int, uptime_seconds: int) -> dict:
     """Build the full /v1/status response payload."""
     gpus = get_gpu_info()
     sys_info = get_system_info()
@@ -163,7 +163,6 @@ def get_full_status(server_name: str, max_concurrent_jobs: int, running_jobs: in
         "ram_gb": sys_info["ram_gb"],
         "ram_used_gb": sys_info["ram_used_gb"],
         "disk_free_gb": sys_info["disk_free_gb"],
-        "max_concurrent_jobs": max_concurrent_jobs,
         "running_jobs": running_jobs,
         "worker_version": "0.1.0",
         "uptime_seconds": uptime_seconds,
