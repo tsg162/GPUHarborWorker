@@ -64,8 +64,16 @@ async def lifespan(app: FastAPI):
     _job_store = JobStore(db_path=DB_PATH)
     _executor = JobExecutor(storage=_storage, job_store=_job_store)
     _checkpoint_mgr = CheckpointManager(storage=_storage, job_store=_job_store)
-    _heartbeat = HeartbeatMonitor(job_store=_job_store)
+    _heartbeat = HeartbeatMonitor(job_store=_job_store, executor=_executor)
     _heartbeat.start()
+
+    # Re-attach to any jobs still running from a previous worker instance
+    reattached = await _executor.reattach_running_jobs(
+        checkpoint_mgr=_checkpoint_mgr
+    )
+    for job_id, task in reattached.items():
+        _job_tasks[job_id] = task
+        task.add_done_callback(lambda t, jid=job_id: _job_tasks.pop(jid, None))
 
     logger.info(
         "GPUHarbor worker started: server=%s, storage=%s, port=%d",
@@ -74,6 +82,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Graceful shutdown: cancel async tasks but job processes survive
+    # (they run in their own sessions via start_new_session=True)
     logger.info("Shutting down GPUHarbor worker...")
     _heartbeat.stop()
     _checkpoint_mgr.stop_all()

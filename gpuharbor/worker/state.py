@@ -231,11 +231,19 @@ class JobStore:
         return dict(row) if row else None
 
     def get_running_job_ids(self) -> list[str]:
-        """Return IDs of all jobs in RUNNING or CHECKPOINTING state."""
+        """Return IDs of all jobs in RUNNING, CHECKPOINTING, or CANCEL_REQUESTED state.
+
+        Includes CANCEL_REQUESTED so that interrupted cancellations can be
+        resumed after a worker restart.
+        """
         conn = self._get_conn()
         rows = conn.execute(
-            "SELECT job_id FROM jobs WHERE state IN (?, ?)",
-            (JobState.RUNNING.value, JobState.CHECKPOINTING.value),
+            "SELECT job_id FROM jobs WHERE state IN (?, ?, ?)",
+            (
+                JobState.RUNNING.value,
+                JobState.CHECKPOINTING.value,
+                JobState.CANCEL_REQUESTED.value,
+            ),
         ).fetchall()
         return [r["job_id"] for r in rows]
 

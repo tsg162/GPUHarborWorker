@@ -5,9 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import TYPE_CHECKING
 
 from gpuharbor.common.states import JobState, is_terminal
 from gpuharbor.worker.state import JobStore
+
+if TYPE_CHECKING:
+    from gpuharbor.worker.executor import JobExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -22,9 +26,11 @@ class HeartbeatMonitor:
     def __init__(
         self,
         job_store: JobStore,
+        executor: JobExecutor | None = None,
         check_interval: int = 15,
     ):
         self._store = job_store
+        self._executor = executor
         self._interval = check_interval
         self._task: asyncio.Task | None = None
         self._running = False
@@ -77,20 +83,39 @@ class HeartbeatMonitor:
 
     async def _check_process(self, job_id: str, pid: int) -> None:
         """Check if a process is still alive by sending signal 0."""
+        # Skip jobs the executor is actively monitoring to avoid races
+        if self._executor and self._executor.is_tracking(job_id):
+            return
+
         try:
             os.kill(pid, 0)  # Doesn't actually send a signal, just checks existence
         except ProcessLookupError:
-            # Process is gone — mark job as failed if still in running state
+            # Process is gone -- mark job appropriately
             job = self._store.get_job(job_id)
             if job and not is_terminal(JobState(job["state"])):
-                error_msg = f"Process {pid} not found (may have been killed by OOM or external signal)"
-                logger.warning("Job %s: %s", job_id, error_msg)
+                state = JobState(job["state"])
                 try:
-                    self._store.update_state(
-                        job_id, JobState.FAILED, error_message=error_msg
-                    )
+                    if state == JobState.CANCEL_REQUESTED:
+                        # Cancel was in progress and process died -- treat as canceled
+                        self._store.update_state(job_id, JobState.CANCELED)
+                        logger.info(
+                            "Job %s: cancel completed (process %d exited)",
+                            job_id,
+                            pid,
+                        )
+                    else:
+                        error_msg = (
+                            f"Process {pid} not found "
+                            f"(may have been killed by OOM or external signal)"
+                        )
+                        logger.warning("Job %s: %s", job_id, error_msg)
+                        self._store.update_state(
+                            job_id,
+                            JobState.FAILED,
+                            error_message=error_msg,
+                        )
                 except (ValueError, KeyError):
                     pass
         except PermissionError:
-            # Process exists but we can't signal it (different user) — it's alive
+            # Process exists but we can't signal it (different user) -- it's alive
             pass

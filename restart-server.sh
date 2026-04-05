@@ -6,6 +6,7 @@ VENV_DIR="/workspace/gpuharbor_venv"
 WORKER_BIN="${VENV_DIR}/bin/gpuharbor-worker"
 STORAGE_ROOT="${GPUHARBOR_STORAGE_ROOT:-/workspace/gpuharbor}"
 ENV_FILE="${STORAGE_ROOT}/worker.env"
+PID_FILE="${STORAGE_ROOT}/worker.pid"
 
 # Re-install package from local source if available
 if [[ -d "${SCRIPT_DIR}/gpuharbor" ]]; then
@@ -27,14 +28,34 @@ if [[ -n "${CONTAINER_ID:-}" ]] && ! grep -q "^GPUHARBOR_VAST_INSTANCE_ID=" "$EN
     echo "Added Vast.ai instance ID (${CONTAINER_ID}) to ${ENV_FILE}"
 fi
 
-echo "Stopping existing GPUHarborWorker process..."
-if pkill -f "gpuharbor-worker"; then
-    echo "Process stopped. Waiting 1 second..."
-    sleep 1
+# Gracefully stop the worker process only (job processes continue in their own sessions)
+echo "Stopping worker process... (running jobs will continue)"
+if [[ -f "$PID_FILE" ]]; then
+    OLD_PID=$(cat "$PID_FILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        kill "$OLD_PID"
+        for i in $(seq 1 10); do
+            kill -0 "$OLD_PID" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "Worker didn't stop gracefully, force killing..."
+            kill -9 "$OLD_PID" 2>/dev/null || true
+            sleep 1
+        fi
+        echo "Worker stopped."
+    else
+        echo "PID $OLD_PID not running."
+    fi
 else
-    echo "No existing process found."
+    echo "No PID file found, checking for stray processes..."
+    pkill -f "gpuharbor-worker" 2>/dev/null || true
+    sleep 1
 fi
 
 echo "Starting GPUHarborWorker..."
 nohup "$WORKER_BIN" > "${STORAGE_ROOT}/worker.log" 2>&1 &
-echo "GPUHarborWorker started (PID: $!). Logs: ${STORAGE_ROOT}/worker.log"
+NEW_PID=$!
+echo "$NEW_PID" > "$PID_FILE"
+echo "GPUHarborWorker started (PID: ${NEW_PID}). Running jobs preserved."
+echo "Logs: ${STORAGE_ROOT}/worker.log"

@@ -341,9 +341,27 @@ chmod 600 "$ENV_FILE"
 
 WORKER_BIN="${VENV_DIR}/bin/gpuharbor-worker"
 
-# Kill any existing worker
-pkill -f "gpuharbor-worker" 2>/dev/null || true
-sleep 1
+# Gracefully stop existing worker (job processes continue in their own sessions)
+if [[ -f "${GPUHARBOR_STORAGE_ROOT}/worker.pid" ]]; then
+    OLD_PID=$(cat "${GPUHARBOR_STORAGE_ROOT}/worker.pid")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        info "Stopping existing worker (PID: ${OLD_PID})... running jobs will continue"
+        kill "$OLD_PID"
+        for i in $(seq 1 10); do
+            kill -0 "$OLD_PID" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$OLD_PID" 2>/dev/null; then
+            warn "Worker didn't stop gracefully, force killing..."
+            kill -9 "$OLD_PID" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+else
+    # Fallback for first install or missing PID file
+    pkill -f "gpuharbor-worker" 2>/dev/null || true
+    sleep 1
+fi
 
 # Start worker with nohup (works everywhere — systemd or not)
 set -a; source "$ENV_FILE"; set +a
@@ -404,12 +422,33 @@ debug "Health check response: ${HEALTH_RESPONSE}"
 cat > "${GPUHARBOR_STORAGE_ROOT}/restart.sh" << 'RESTARTEOF'
 #!/usr/bin/env bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-pkill -f "gpuharbor-worker" 2>/dev/null || true
-sleep 1
+PID_FILE="$SCRIPT_DIR/worker.pid"
+
+# Gracefully stop worker (job processes continue in their own sessions)
+if [[ -f "$PID_FILE" ]]; then
+    OLD_PID=$(cat "$PID_FILE")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "Stopping worker (PID: $OLD_PID)... running jobs will continue"
+        kill "$OLD_PID"
+        for i in $(seq 1 10); do
+            kill -0 "$OLD_PID" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$OLD_PID" 2>/dev/null; then
+            echo "Force killing worker..."
+            kill -9 "$OLD_PID" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+else
+    pkill -f "gpuharbor-worker" 2>/dev/null || true
+    sleep 1
+fi
+
 set -a; source "$SCRIPT_DIR/worker.env"; set +a
 nohup "/workspace/gpuharbor_venv/bin/gpuharbor-worker" > "$SCRIPT_DIR/worker.log" 2>&1 &
-echo $! > "$SCRIPT_DIR/worker.pid"
-echo "Worker restarted (PID: $!)"
+echo $! > "$PID_FILE"
+echo "Worker restarted (PID: $!). Running jobs preserved."
 RESTARTEOF
 chmod +x "${GPUHARBOR_STORAGE_ROOT}/restart.sh"
 
