@@ -145,6 +145,15 @@ else
     info "Using configured port: ${GPUHARBOR_PORT}"
 fi
 
+# ── Detect Vast.ai instance ID ───────────────────────────────────────
+#
+# Vast.ai sets CONTAINER_ID=<instance_id> in the environment.
+
+VAST_INSTANCE_ID="${CONTAINER_ID:-}"
+if [[ -n "$VAST_INSTANCE_ID" ]]; then
+    info "Vast.ai instance ID detected: ${VAST_INSTANCE_ID}"
+fi
+
 # ── Pre-flight checks ──────────────────────────────────────────────────
 
 echo ""
@@ -320,6 +329,7 @@ GPUHARBOR_PORT=${GPUHARBOR_PORT}
 GPUHARBOR_DB_PATH=${GPUHARBOR_STORAGE_ROOT}/jobs.db
 GPUHARBOR_STORAGE_ROOT=${GPUHARBOR_STORAGE_ROOT}
 GPUHARBOR_LOG_LEVEL=${GPUHARBOR_LOG_LEVEL}
+GPUHARBOR_VAST_INSTANCE_ID=${VAST_INSTANCE_ID}
 ENVEOF
 
 if [[ -n "$TLS_CERT_PATH" ]]; then

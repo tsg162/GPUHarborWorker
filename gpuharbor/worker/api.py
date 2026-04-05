@@ -40,6 +40,7 @@ STORAGE_ROOT = Path(os.environ.get("GPUHARBOR_STORAGE_ROOT", "/workspace/gpuharb
 PORT = int(os.environ.get("GPUHARBOR_PORT", "5000"))
 TLS_CERT = os.environ.get("GPUHARBOR_TLS_CERT", "")
 TLS_KEY = os.environ.get("GPUHARBOR_TLS_KEY", "")
+VAST_INSTANCE_ID = os.environ.get("GPUHARBOR_VAST_INSTANCE_ID", "")
 
 # ── Globals initialised at startup ─────��────────────────────────────────
 
@@ -109,7 +110,7 @@ async def get_status():
     """Return server state: GPUs, utilization, memory, jobs, disk."""
     running_jobs = _job_store.count_active_jobs() if _job_store else 0
     uptime = int(time.time() - _start_time) if _start_time else 0
-    status = get_full_status(SERVER_NAME, running_jobs, uptime)
+    status = get_full_status(SERVER_NAME, running_jobs, uptime, VAST_INSTANCE_ID)
     # Add disk info from storage
     if _storage:
         status["disk_free_gb"] = _storage.disk_free_gb()

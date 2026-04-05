@@ -151,12 +151,17 @@ def _get_cpu_count() -> int:
     return os.cpu_count() or 1
 
 
-def get_full_status(server_name: str, running_jobs: int, uptime_seconds: int) -> dict:
+def get_full_status(
+    server_name: str,
+    running_jobs: int,
+    uptime_seconds: int,
+    vast_instance_id: str = "",
+) -> dict:
     """Build the full /v1/status response payload."""
     gpus = get_gpu_info()
     sys_info = get_system_info()
 
-    return {
+    status = {
         "hostname": server_name,
         "gpus": [asdict(g) for g in gpus],
         "cpu_count": sys_info["cpu_count"],
@@ -167,3 +172,8 @@ def get_full_status(server_name: str, running_jobs: int, uptime_seconds: int) ->
         "worker_version": "0.1.0",
         "uptime_seconds": uptime_seconds,
     }
+
+    if vast_instance_id:
+        status["vast_instance_id"] = vast_instance_id
+
+    return status
