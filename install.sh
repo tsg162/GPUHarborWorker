@@ -15,6 +15,7 @@
 #   GPUHARBOR_PORT                 Internal bind port (auto-detected, default: 5000)
 #   GPUHARBOR_TLS                  "auto" (self-signed), "none" (default), or cert path prefix
 #   GPUHARBOR_STORAGE_ROOT         Storage root (default: /workspace/gpuharbor)
+#   GPUHARBOR_TUNNEL_TOKEN         Cloudflare named tunnel token (enables persistent tunnel)
 
 set -euo pipefail
 
@@ -337,6 +338,10 @@ if [[ -n "$TLS_CERT_PATH" ]]; then
     echo "GPUHARBOR_TLS_KEY=${TLS_KEY_PATH}" >> "$ENV_FILE"
 fi
 
+if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
+    echo "GPUHARBOR_TUNNEL_TOKEN=${GPUHARBOR_TUNNEL_TOKEN}" >> "$ENV_FILE"
+fi
+
 chmod 600 "$ENV_FILE"
 
 WORKER_BIN="${VENV_DIR}/bin/gpuharbor-worker"
@@ -418,11 +423,70 @@ fi
 success "Worker started and healthy (PID: ${WORKER_PID})"
 debug "Health check response: ${HEALTH_RESPONSE}"
 
+# ── Step 6: Start Cloudflare tunnel (if token provided) ──────────────
+
+TUNNEL_URL=""
+if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
+    info "Step 6/6: Starting Cloudflare tunnel..."
+
+    # Install cloudflared if not present
+    if ! command -v cloudflared &>/dev/null; then
+        info "Installing cloudflared..."
+        ARCH=$(uname -m)
+        case "$ARCH" in
+            x86_64|amd64) CF_ARCH="amd64" ;;
+            aarch64|arm64) CF_ARCH="arm64" ;;
+            *) fatal "Unsupported architecture: $ARCH" ;;
+        esac
+        curl -sL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" -o /usr/local/bin/cloudflared
+        chmod +x /usr/local/bin/cloudflared
+        success "cloudflared installed"
+    else
+        success "cloudflared already installed"
+    fi
+
+    # Stop existing tunnel process
+    if [[ -f "${GPUHARBOR_STORAGE_ROOT}/tunnel.pid" ]]; then
+        OLD_TUNNEL_PID=$(cat "${GPUHARBOR_STORAGE_ROOT}/tunnel.pid")
+        if kill -0 "$OLD_TUNNEL_PID" 2>/dev/null; then
+            info "Stopping existing tunnel (PID: ${OLD_TUNNEL_PID})..."
+            kill "$OLD_TUNNEL_PID" 2>/dev/null || true
+            sleep 2
+            kill -9 "$OLD_TUNNEL_PID" 2>/dev/null || true
+        fi
+    fi
+
+    # Start tunnel
+    nohup cloudflared tunnel run --token "$GPUHARBOR_TUNNEL_TOKEN" \
+        > "${GPUHARBOR_STORAGE_ROOT}/tunnel.log" 2>&1 &
+    TUNNEL_PID=$!
+    echo "$TUNNEL_PID" > "${GPUHARBOR_STORAGE_ROOT}/tunnel.pid"
+
+    # Wait briefly and verify cloudflared is still running
+    sleep 3
+    if kill -0 "$TUNNEL_PID" 2>/dev/null; then
+        success "Cloudflare tunnel started (PID: ${TUNNEL_PID})"
+        # Extract the hostname from the tunnel connector log
+        TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9._-]+\.[a-zA-Z]+' "${GPUHARBOR_STORAGE_ROOT}/tunnel.log" 2>/dev/null | head -1 || true)
+        if [[ -z "$TUNNEL_URL" ]]; then
+            # Tunnel is running but hostname not yet in logs — that's fine
+            info "Tunnel is running. Check 'tunnel.log' or Cloudflare dashboard for the hostname."
+        fi
+    else
+        error "Cloudflare tunnel failed to start. Check ${GPUHARBOR_STORAGE_ROOT}/tunnel.log"
+        tail -10 "${GPUHARBOR_STORAGE_ROOT}/tunnel.log" 2>/dev/null || true
+    fi
+else
+    info "No GPUHARBOR_TUNNEL_TOKEN set — skipping Cloudflare tunnel."
+    info "Set GPUHARBOR_TUNNEL_TOKEN in .env for a persistent tunnel, or start a quick tunnel manually."
+fi
+
 # Write restart helper
 cat > "${GPUHARBOR_STORAGE_ROOT}/restart.sh" << 'RESTARTEOF'
 #!/usr/bin/env bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PID_FILE="$SCRIPT_DIR/worker.pid"
+TUNNEL_PID_FILE="$SCRIPT_DIR/tunnel.pid"
 
 # Gracefully stop worker (job processes continue in their own sessions)
 if [[ -f "$PID_FILE" ]]; then
@@ -446,9 +510,22 @@ else
 fi
 
 set -a; source "$SCRIPT_DIR/worker.env"; set +a
+
 nohup "/workspace/gpuharbor_venv/bin/gpuharbor-worker" > "$SCRIPT_DIR/worker.log" 2>&1 &
 echo $! > "$PID_FILE"
 echo "Worker restarted (PID: $!). Running jobs preserved."
+
+# Restart Cloudflare tunnel if token is configured
+if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
+    if [[ -f "$TUNNEL_PID_FILE" ]]; then
+        OLD_TUNNEL=$(cat "$TUNNEL_PID_FILE")
+        kill "$OLD_TUNNEL" 2>/dev/null || true
+        sleep 2
+    fi
+    nohup cloudflared tunnel run --token "$GPUHARBOR_TUNNEL_TOKEN" > "$SCRIPT_DIR/tunnel.log" 2>&1 &
+    echo $! > "$TUNNEL_PID_FILE"
+    echo "Tunnel restarted (PID: $!)."
+fi
 RESTARTEOF
 chmod +x "${GPUHARBOR_STORAGE_ROOT}/restart.sh"
 
@@ -475,23 +552,47 @@ echo -e "  CUDA:  ${CUDA_VERSION}"
 echo -e "  Disk:  ${DISK_FREE}GB free"
 echo -e "  Store: ${GPUHARBOR_STORAGE_ROOT}"
 echo ""
-echo -e "${BOLD}──── Next Steps ────${NC}"
-echo ""
-echo -e "  ${BOLD}1.${NC} Create a Cloudflare tunnel to expose the worker:"
-echo ""
-echo -e "     ${CYAN}cloudflared tunnel --url ${LOCAL_URL}${NC}"
-echo ""
-echo -e "  ${BOLD}2.${NC} Add the tunnel URL to ${CYAN}~/.gpuharbor/servers.yaml${NC} on your laptop:"
-echo ""
-echo -e "     ${YELLOW}servers:${NC}"
-echo -e "     ${YELLOW}  my-gpu:${NC}"
-echo -e "     ${YELLOW}    url: https://<your-tunnel-url>.trycloudflare.com${NC}"
-echo -e "     ${YELLOW}    token: ${AUTH_TOKEN}${NC}"
-echo -e "     ${YELLOW}    description: \"${GPU_COUNT}x ${GPU_FIRST_NAME}\"${NC}"
-echo ""
-echo -e "  ${BOLD}3.${NC} Test from your laptop:"
-echo ""
-echo -e "     ${CYAN}gpuharbor servers info${NC}"
+if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
+    echo -e "${BOLD}──── Tunnel ────${NC}"
+    echo ""
+    if [[ -n "$TUNNEL_URL" ]]; then
+        echo -e "  Tunnel URL: ${BOLD}${TUNNEL_URL}${NC}"
+    else
+        echo -e "  Tunnel:     ${BOLD}running${NC} (check Cloudflare dashboard for hostname)"
+    fi
+    echo -e "  Tunnel log: ${CYAN}tail -f ${GPUHARBOR_STORAGE_ROOT}/tunnel.log${NC}"
+    echo ""
+    echo -e "${BOLD}──── Next Steps ────${NC}"
+    echo ""
+    echo -e "  Add the server to ${CYAN}~/.gpuharbor/servers.yaml${NC} on your laptop (if not already):"
+    echo ""
+    echo -e "     ${CYAN}gpuharbor servers add ${HOSTNAME_LABEL} \\${NC}"
+    echo -e "     ${CYAN}    --url https://<your-tunnel-hostname> \\${NC}"
+    echo -e "     ${CYAN}    --token ${AUTH_TOKEN}${NC}"
+    echo ""
+    echo -e "  Test from your laptop:"
+    echo ""
+    echo -e "     ${CYAN}gpuharbor servers${NC}"
+else
+    echo -e "${BOLD}──── Next Steps ────${NC}"
+    echo ""
+    echo -e "  ${BOLD}Option A: Named tunnel (recommended — permanent URL)${NC}"
+    echo ""
+    echo -e "  On your laptop, create a tunnel with:"
+    echo -e "     ${CYAN}./setup-tunnel.sh ${HOSTNAME_LABEL} gpuharbor.xyz${NC}"
+    echo ""
+    echo -e "  Then set GPUHARBOR_TUNNEL_TOKEN in .env and re-run install.sh."
+    echo ""
+    echo -e "  ${BOLD}Option B: Quick tunnel (temporary — expires ~24h)${NC}"
+    echo ""
+    echo -e "     ${CYAN}cloudflared tunnel --url ${LOCAL_URL}${NC}"
+    echo ""
+    echo -e "  Then add to ${CYAN}~/.gpuharbor/servers.yaml${NC} on your laptop:"
+    echo ""
+    echo -e "     ${CYAN}gpuharbor servers add ${HOSTNAME_LABEL} \\${NC}"
+    echo -e "     ${CYAN}    --url https://<tunnel-url>.trycloudflare.com \\${NC}"
+    echo -e "     ${CYAN}    --token ${AUTH_TOKEN}${NC}"
+fi
 echo ""
 echo -e "${BOLD}──── Management ────${NC}"
 echo ""

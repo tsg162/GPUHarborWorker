@@ -7,6 +7,7 @@ WORKER_BIN="${VENV_DIR}/bin/gpuharbor-worker"
 STORAGE_ROOT="${GPUHARBOR_STORAGE_ROOT:-/workspace/gpuharbor}"
 ENV_FILE="${STORAGE_ROOT}/worker.env"
 PID_FILE="${STORAGE_ROOT}/worker.pid"
+TUNNEL_PID_FILE="${STORAGE_ROOT}/tunnel.pid"
 
 # Re-install package from local source if available
 if [[ -d "${SCRIPT_DIR}/gpuharbor" ]]; then
@@ -59,3 +60,22 @@ NEW_PID=$!
 echo "$NEW_PID" > "$PID_FILE"
 echo "GPUHarborWorker started (PID: ${NEW_PID}). Running jobs preserved."
 echo "Logs: ${STORAGE_ROOT}/worker.log"
+
+# Restart Cloudflare tunnel if token is configured
+if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
+    echo "Restarting Cloudflare tunnel..."
+    if [[ -f "$TUNNEL_PID_FILE" ]]; then
+        OLD_TUNNEL_PID=$(cat "$TUNNEL_PID_FILE")
+        if kill -0 "$OLD_TUNNEL_PID" 2>/dev/null; then
+            kill "$OLD_TUNNEL_PID" 2>/dev/null || true
+            sleep 2
+            kill -9 "$OLD_TUNNEL_PID" 2>/dev/null || true
+        fi
+    fi
+    nohup cloudflared tunnel run --token "$GPUHARBOR_TUNNEL_TOKEN" \
+        > "${STORAGE_ROOT}/tunnel.log" 2>&1 &
+    TUNNEL_PID=$!
+    echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
+    echo "Cloudflare tunnel restarted (PID: ${TUNNEL_PID})."
+    echo "Tunnel logs: ${STORAGE_ROOT}/tunnel.log"
+fi
