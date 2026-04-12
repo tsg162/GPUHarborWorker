@@ -262,7 +262,13 @@ info "Step 3/5: Setting up authentication..."
 mkdir -p "${GPUHARBOR_STORAGE_ROOT}"
 TOKEN_FILE="${GPUHARBOR_STORAGE_ROOT}/auth_token"
 
-if [[ -f "$TOKEN_FILE" ]]; then
+if [[ -n "${GPUHARBOR_AUTH_TOKEN:-}" ]]; then
+    # Pre-configured token (from gpuharbor deploy)
+    AUTH_TOKEN="$GPUHARBOR_AUTH_TOKEN"
+    echo "$AUTH_TOKEN" > "$TOKEN_FILE"
+    chmod 600 "$TOKEN_FILE"
+    success "Using pre-configured auth token"
+elif [[ -f "$TOKEN_FILE" ]]; then
     AUTH_TOKEN=$(cat "$TOKEN_FILE")
     success "Using existing auth token"
 else
@@ -562,36 +568,43 @@ if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
     fi
     echo -e "  Tunnel log: ${CYAN}tail -f ${GPUHARBOR_STORAGE_ROOT}/tunnel.log${NC}"
     echo ""
-    echo -e "${BOLD}──── Next Steps ────${NC}"
-    echo ""
-    echo -e "  Add the server to ${CYAN}~/.gpuharbor/servers.yaml${NC} on your laptop (if not already):"
-    echo ""
-    echo -e "     ${CYAN}gpuharbor servers add ${HOSTNAME_LABEL} \\${NC}"
-    echo -e "     ${CYAN}    --url https://<your-tunnel-hostname> \\${NC}"
-    echo -e "     ${CYAN}    --token ${AUTH_TOKEN}${NC}"
-    echo ""
-    echo -e "  Test from your laptop:"
-    echo ""
-    echo -e "     ${CYAN}gpuharbor servers${NC}"
-else
-    echo -e "${BOLD}──── Next Steps ────${NC}"
-    echo ""
-    echo -e "  ${BOLD}Option A: Named tunnel (recommended — permanent URL)${NC}"
-    echo ""
-    echo -e "  On your laptop, create a tunnel with:"
-    echo -e "     ${CYAN}./setup-tunnel.sh ${HOSTNAME_LABEL} gpuharbor.xyz${NC}"
-    echo ""
-    echo -e "  Then set GPUHARBOR_TUNNEL_TOKEN in .env and re-run install.sh."
-    echo ""
-    echo -e "  ${BOLD}Option B: Quick tunnel (temporary — expires ~24h)${NC}"
-    echo ""
-    echo -e "     ${CYAN}cloudflared tunnel --url ${LOCAL_URL}${NC}"
-    echo ""
-    echo -e "  Then add to ${CYAN}~/.gpuharbor/servers.yaml${NC} on your laptop:"
-    echo ""
-    echo -e "     ${CYAN}gpuharbor servers add ${HOSTNAME_LABEL} \\${NC}"
-    echo -e "     ${CYAN}    --url https://<tunnel-url>.trycloudflare.com \\${NC}"
-    echo -e "     ${CYAN}    --token ${AUTH_TOKEN}${NC}"
+fi
+
+# When called from setup.sh (GPUHARBOR_QUIET_HINTS=1), skip Next Steps —
+# setup.sh prints its own with the complete gpuharbor servers add command.
+if [[ -z "${GPUHARBOR_QUIET_HINTS:-}" ]]; then
+    if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
+        echo -e "${BOLD}──── Next Steps ────${NC}"
+        echo ""
+        echo -e "  Add the server to ${CYAN}~/.gpuharbor/servers.yaml${NC} on your laptop (if not already):"
+        echo ""
+        echo -e "     ${CYAN}gpuharbor servers add ${HOSTNAME_LABEL} \\${NC}"
+        echo -e "     ${CYAN}    --url https://<your-tunnel-hostname> \\${NC}"
+        echo -e "     ${CYAN}    --token ${AUTH_TOKEN}${NC}"
+        echo ""
+        echo -e "  Test from your laptop:"
+        echo ""
+        echo -e "     ${CYAN}gpuharbor servers${NC}"
+    else
+        echo -e "${BOLD}──── Next Steps ────${NC}"
+        echo ""
+        echo -e "  ${BOLD}Option A: Named tunnel (recommended — permanent URL)${NC}"
+        echo ""
+        echo -e "  On your laptop, create a tunnel with:"
+        echo -e "     ${CYAN}./setup-tunnel.sh ${HOSTNAME_LABEL} gpuharbor.xyz${NC}"
+        echo ""
+        echo -e "  Then set GPUHARBOR_TUNNEL_TOKEN in .env and re-run install.sh."
+        echo ""
+        echo -e "  ${BOLD}Option B: Quick tunnel (temporary — expires ~24h)${NC}"
+        echo ""
+        echo -e "     ${CYAN}cloudflared tunnel --url ${LOCAL_URL}${NC}"
+        echo ""
+        echo -e "  Then add to ${CYAN}~/.gpuharbor/servers.yaml${NC} on your laptop:"
+        echo ""
+        echo -e "     ${CYAN}gpuharbor servers add ${HOSTNAME_LABEL} \\${NC}"
+        echo -e "     ${CYAN}    --url https://<tunnel-url>.trycloudflare.com \\${NC}"
+        echo -e "     ${CYAN}    --token ${AUTH_TOKEN}${NC}"
+    fi
 fi
 echo ""
 echo -e "${BOLD}──── Management ────${NC}"
