@@ -165,12 +165,34 @@ class LocalStorage:
 
     # ── Cleanup ─────────────────────────────────────────────────────────
 
-    def cleanup_job(self, job_id: str) -> None:
-        """Remove all files for a job."""
+    def path_size_bytes(self, path: Path) -> int:
+        """Return the total size of a file or directory tree."""
+        if not path.exists():
+            return 0
+        if path.is_file():
+            return path.stat().st_size
+        total = 0
+        for child in path.rglob("*"):
+            if child.is_file():
+                try:
+                    total += child.stat().st_size
+                except OSError:
+                    continue
+        return total
+
+    def cleanup_job(self, job_id: str) -> int:
+        """Remove all files for a job and return approximate bytes freed."""
         job_dir = self.job_dir(job_id)
         if job_dir.exists():
+            bytes_freed = self.path_size_bytes(job_dir)
             shutil.rmtree(job_dir, ignore_errors=True)
-            logger.info("Cleaned up job directory: %s", job_dir)
+            logger.info(
+                "Cleaned up job directory: %s (freed %.2f GB)",
+                job_dir,
+                bytes_freed / (1024**3),
+            )
+            return bytes_freed
+        return 0
 
     def prune_checkpoints(self, job_id: str, keep_last_n: int) -> list[Path]:
         """Delete old checkpoints, keeping only the most recent N.

@@ -360,6 +360,45 @@ async def list_job_artifacts(job_id: str):
     return {"job_id": job_id, "artifacts": artifacts}
 
 
+@app.post("/v1/cleanup", dependencies=[Depends(verify_auth)])
+async def cleanup_terminal_jobs(
+    project: Optional[str] = Query(
+        None,
+        description="Only cleanup terminal jobs in this project",
+    ),
+    limit: int = Query(1000, ge=1, le=5000),
+):
+    """Delete terminal job workspaces while retaining job/artifact metadata."""
+    if not _executor:
+        raise HTTPException(status_code=503, detail="Worker not initialized")
+    return _executor.cleanup_terminal_job_dirs(project=project, limit=limit)
+
+
+@app.post("/v1/jobs/{job_id}/cleanup", dependencies=[Depends(verify_auth)])
+async def cleanup_job_files(job_id: str):
+    """Delete one terminal job workspace while retaining job/artifact metadata."""
+    if not _job_store or not _storage:
+        raise HTTPException(status_code=503, detail="Worker not initialized")
+
+    job = _job_store.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
+    if not is_terminal(JobState(job["state"])):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job is not terminal: {job['state']}",
+        )
+
+    bytes_freed = _storage.cleanup_job(job_id)
+    return {
+        "job_id": job_id,
+        "state": job["state"],
+        "bytes_freed": bytes_freed,
+        "gb_freed": round(bytes_freed / (1024**3), 3),
+        "disk_free_gb": _storage.disk_free_gb(),
+    }
+
+
 # ── Artifact download URL (returns file path for direct download) ──────
 
 @app.get("/v1/artifacts/{artifact_id}/download-url", dependencies=[Depends(verify_auth)])

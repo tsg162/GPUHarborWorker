@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from gpuharbor.common.states import JobState, validate_transition
+from gpuharbor.common.states import JobState, TERMINAL_STATES, validate_transition
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +255,30 @@ class JobStore:
             (JobState.COMPLETED.value, JobState.FAILED.value, JobState.CANCELED.value),
         ).fetchone()
         return row["cnt"] if row else 0
+
+    def list_terminal_jobs(
+        self,
+        *,
+        project: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        """Return terminal jobs, oldest completion first."""
+        conn = self._get_conn()
+        states = tuple(state.value for state in TERMINAL_STATES)
+        placeholders = ", ".join("?" for _ in states)
+        where = [f"state IN ({placeholders})"]
+        params: list = [*states]
+        if project:
+            where.append("project = ?")
+            params.append(project)
+        rows = conn.execute(
+            f"""SELECT * FROM jobs
+                WHERE {" AND ".join(where)}
+                ORDER BY COALESCE(completed_at, created_at), created_at
+                LIMIT ?""",
+            (*params, limit),
+        ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
 
     @staticmethod
     def _row_to_dict(row: sqlite3.Row) -> dict:

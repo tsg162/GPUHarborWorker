@@ -71,7 +71,7 @@ class JobExecutor:
         process_started = False
 
         try:
-            self._validate_resources(spec)
+            self._validate_resources(job_id, spec)
             await self._prepare_workspace(job_id, spec)
             proc = await self._start_process(job_id, spec)
             process_started = True
@@ -288,7 +288,42 @@ class JobExecutor:
 
     # ── Process lifecycle ──────────────────────────────────────────────
 
-    def _validate_resources(self, spec: JobSpec) -> None:
+    def cleanup_terminal_job_dirs(
+        self,
+        *,
+        exclude_job_id: str | None = None,
+        project: str | None = None,
+        limit: int = 1000,
+    ) -> dict:
+        """Delete files for terminal jobs while preserving DB records."""
+        cleaned: list[dict] = []
+        bytes_freed = 0
+        for job in self._store.list_terminal_jobs(project=project, limit=limit):
+            job_id = str(job["job_id"])
+            if exclude_job_id and job_id == exclude_job_id:
+                continue
+            freed = self._storage.cleanup_job(job_id)
+            if freed:
+                bytes_freed += freed
+                cleaned.append(
+                    {
+                        "job_id": job_id,
+                        "state": job.get("state"),
+                        "project": job.get("project"),
+                        "bytes_freed": freed,
+                    }
+                )
+        return {
+            "cleaned": cleaned,
+            "cleaned_count": len(cleaned),
+            "project": project,
+            "limit": limit,
+            "bytes_freed": bytes_freed,
+            "gb_freed": round(bytes_freed / (1024**3), 3),
+            "disk_free_gb": self._storage.disk_free_gb(),
+        }
+
+    def _validate_resources(self, job_id: str, spec: JobSpec) -> None:
         """Check that the server can satisfy the job's resource requirements."""
         from gpuharbor.worker.gpu import get_gpu_info
 
@@ -300,6 +335,19 @@ class JobExecutor:
 
         if spec.resources.disk_gb_min > 0:
             free_gb = self._storage.disk_free_gb()
+            if (
+                free_gb < spec.resources.disk_gb_min
+                and os.environ.get("GPUHARBOR_CLEANUP_ON_LOW_DISK", "1").lower()
+                not in {"0", "false", "no"}
+            ):
+                cleanup = self.cleanup_terminal_job_dirs(exclude_job_id=job_id)
+                logger.info(
+                    "Low disk cleanup before job %s: freed %.3f GB; disk_free_gb=%.1f",
+                    job_id,
+                    cleanup["gb_freed"],
+                    cleanup["disk_free_gb"],
+                )
+                free_gb = self._storage.disk_free_gb()
             if free_gb < spec.resources.disk_gb_min:
                 raise ValueError(
                     f"Job requires {spec.resources.disk_gb_min}GB free disk "
