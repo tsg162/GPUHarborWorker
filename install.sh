@@ -490,9 +490,29 @@ fi
 # Write restart helper
 cat > "${GPUHARBOR_STORAGE_ROOT}/restart.sh" << 'RESTARTEOF'
 #!/usr/bin/env bash
+set -euo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PID_FILE="$SCRIPT_DIR/worker.pid"
 TUNNEL_PID_FILE="$SCRIPT_DIR/tunnel.pid"
+REPO_DIR="${GPUHARBOR_WORKER_REPO:-/workspace/GPUHarborWorker}"
+VENV_DIR="${GPUHARBOR_WORKER_VENV:-/workspace/gpuharbor_venv}"
+UPDATE=0
+
+if [[ "${1:-}" == "--update" || "${GPUHARBOR_AUTO_UPDATE_ON_RESTART:-0}" == "1" ]]; then
+    UPDATE=1
+fi
+
+if [[ "$UPDATE" == "1" ]]; then
+    if [[ ! -d "$REPO_DIR/.git" ]]; then
+        echo "Cannot update: GPUHarborWorker git repo not found at $REPO_DIR" >&2
+        exit 1
+    fi
+    echo "Updating GPUHarborWorker in $REPO_DIR..."
+    git -C "$REPO_DIR" pull --ff-only
+    echo "Reinstalling worker package from local source..."
+    "$VENV_DIR/bin/pip" install -q "$REPO_DIR"
+fi
 
 # Gracefully stop worker (job processes continue in their own sessions)
 if [[ -f "$PID_FILE" ]]; then
@@ -517,7 +537,7 @@ fi
 
 set -a; source "$SCRIPT_DIR/worker.env"; set +a
 
-nohup "/workspace/gpuharbor_venv/bin/gpuharbor-worker" > "$SCRIPT_DIR/worker.log" 2>&1 &
+nohup "$VENV_DIR/bin/gpuharbor-worker" > "$SCRIPT_DIR/worker.log" 2>&1 &
 echo $! > "$PID_FILE"
 echo "Worker restarted (PID: $!). Running jobs preserved."
 

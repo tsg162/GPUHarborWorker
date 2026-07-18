@@ -94,6 +94,8 @@ All endpoints require `Authorization: Bearer <token>` (except `/health`).
 | `POST` | `/v1/jobs/{id}/cancel` | Request cancellation |
 | `GET` | `/v1/jobs/{id}/logs` | Fetch logs (`?follow=true` for SSE streaming) |
 | `GET` | `/v1/jobs/{id}/artifacts` | List artifacts |
+| `POST` | `/v1/cleanup` | Delete terminal job workspaces (`?project=...&limit=...`) |
+| `POST` | `/v1/jobs/{id}/cleanup` | Delete one terminal job workspace |
 | `POST` | `/v1/metrics` | Report training metrics |
 
 ## Managing the Worker
@@ -102,8 +104,23 @@ All endpoints require `Authorization: Bearer <token>` (except `/health`).
 tail -f /workspace/gpuharbor/worker.log    # live worker logs
 tail -f /workspace/gpuharbor/tunnel.log    # live tunnel logs
 bash /workspace/gpuharbor/restart.sh       # restart worker + tunnel
+bash /workspace/gpuharbor/restart.sh --update
 curl http://localhost:5000/health           # health check
 ```
+
+Use `--update` when you want the worker to pull the latest code before
+restarting. It runs:
+
+```bash
+git -C /workspace/GPUHarborWorker pull --ff-only
+/workspace/gpuharbor_venv/bin/pip install -q /workspace/GPUHarborWorker
+bash /workspace/gpuharbor/restart.sh
+```
+
+The worker process can be restarted while jobs are running; training
+subprocesses run in their own sessions and the worker re-attaches after
+restart. Set `GPUHARBOR_AUTO_UPDATE_ON_RESTART=1` to make every restart pull
+and reinstall first.
 
 ## Re-running install.sh
 
@@ -111,3 +128,14 @@ The script is idempotent. Running it again will:
 - Skip already-installed components
 - Reuse the existing auth token
 - Restart the worker and tunnel
+
+## Canonical Source
+
+Worker bugs and API changes belong in this repository:
+
+```text
+GPUHarborWorker/gpuharbor/worker/
+```
+
+The `GPUHarbor` repository is the CLI/client repo. It must not carry or deploy
+a second worker implementation.
