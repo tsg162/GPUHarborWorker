@@ -1,0 +1,9 @@
+.git
+.env
+.env.*
+**/__pycache__
+.venv
+tests
+dashboard/node_modules
+*.tar
+*.json

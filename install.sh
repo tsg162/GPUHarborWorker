@@ -38,15 +38,11 @@ debug()   { echo -e "${DIM}       $*${NC}"; }
 
 # ── Load .env if present ───────────────────────────────────────────────
 
-# Clear stale port config that may linger from a previous run's worker.env
-# so that only values explicitly set in .env (or auto-detected) are used.
-unset GPUHARBOR_PORT GPUHARBOR_EXTERNAL_PORT 2>/dev/null || true
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-if [[ -f "${SCRIPT_DIR}/.env" ]]; then
+if [[ "${GPUHARBOR_SKIP_DOTENV:-0}" != "1" && -f "${SCRIPT_DIR}/.env" ]]; then
     info "Loading configuration from ${SCRIPT_DIR}/.env"
     set -a; source "${SCRIPT_DIR}/.env"; set +a
-elif [[ -f ".env" ]]; then
+elif [[ "${GPUHARBOR_SKIP_DOTENV:-0}" != "1" && -f ".env" ]]; then
     info "Loading configuration from .env"
     set -a; source ".env"; set +a
 fi
@@ -56,8 +52,14 @@ fi
 GPUHARBOR_TLS="${GPUHARBOR_TLS:-none}"
 GPUHARBOR_STORAGE_ROOT="${GPUHARBOR_STORAGE_ROOT:-/workspace/gpuharbor}"
 GPUHARBOR_LOG_LEVEL="${GPUHARBOR_LOG_LEVEL:-info}"
+if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
+    GPUHARBOR_HOST="${GPUHARBOR_HOST:-127.0.0.1}"
+else
+    GPUHARBOR_HOST="${GPUHARBOR_HOST:-0.0.0.0}"
+fi
 
 PYTHON_MIN_VERSION="3.10"
+PREVIOUS_WORKER_ENV="${GPUHARBOR_STORAGE_ROOT}/worker.env"
 
 # ── Auto-detect port (Vast.ai awareness) ───────────────────────────────
 #
@@ -70,6 +72,75 @@ port_is_free() {
     ! ss -tlnp 2>/dev/null | grep -q ":${1} " && return 0
     return 1
 }
+
+valid_port() {
+    [[ "${1:-}" =~ ^[0-9]+$ ]] && [[ "$1" -ge 1 ]] && [[ "$1" -le 65535 ]]
+}
+
+valid_listener_host() {
+    local host="${1:-}"
+    [[ -n "$host" ]] \
+        && [[ "${#host}" -le 253 ]] \
+        && [[ "$host" =~ ^[A-Za-z0-9_.:%-]+$ ]]
+}
+
+vastai_is_detected() {
+    compgen -v VAST_TCP_PORT_ 2>/dev/null | grep -q .
+}
+
+vast_external_port() {
+    local internal="$1"
+    local mapping_var="VAST_TCP_PORT_${internal}"
+    local external="${!mapping_var:-}"
+    if valid_port "$external"; then
+        echo "$external"
+        return 0
+    fi
+    return 1
+}
+
+read_worker_env_value() {
+    local key="$1"
+    [[ -r "$PREVIOUS_WORKER_ENV" ]] || return 1
+    sed -n "s/^${key}=//p" "$PREVIOUS_WORKER_ENV" | tail -1
+}
+
+render_worker_env() {
+    local env_file="$1"
+    local hostname_label="$2"
+    local auth_token="$3"
+    local vast_instance_id="$4"
+    local tls_cert_path="${5:-}"
+    local tls_key_path="${6:-}"
+
+    mkdir -p "$(dirname "$env_file")"
+    {
+        printf 'GPUHARBOR_SERVER_NAME=%q\n' "$hostname_label"
+        printf 'GPUHARBOR_AUTH_TOKEN=%q\n' "$auth_token"
+        printf 'GPUHARBOR_HOST=%q\n' "$GPUHARBOR_HOST"
+        printf 'GPUHARBOR_PORT=%q\n' "$GPUHARBOR_PORT"
+        printf 'GPUHARBOR_EXTERNAL_PORT=%q\n' "$GPUHARBOR_EXTERNAL_PORT"
+        printf 'GPUHARBOR_DB_PATH=%s/jobs.db\n' "$GPUHARBOR_STORAGE_ROOT"
+        printf 'GPUHARBOR_STORAGE_ROOT=%q\n' "$GPUHARBOR_STORAGE_ROOT"
+        printf 'GPUHARBOR_LOG_LEVEL=%q\n' "$GPUHARBOR_LOG_LEVEL"
+        printf 'GPUHARBOR_VAST_INSTANCE_ID=%q\n' "$vast_instance_id"
+        local key
+        for key in GPUHARBOR_CACHE_ROOT GPUHARBOR_BACKUP_DEST GPUHARBOR_TRAINING_PYTHON GPUHARBOR_WORKER_URL GPUHARBOR_WORKER_REF GPUHARBOR_WORKER_REPO GPUHARBOR_WORKER_VENV RCLONE_CONFIG; do
+            if [[ -n "${!key:-}" ]]; then printf '%s=%q\n' "$key" "${!key}"; fi
+        done
+        if [[ -n "$tls_cert_path" ]]; then
+            printf 'GPUHARBOR_TLS_CERT=%q\n' "$tls_cert_path"
+            printf 'GPUHARBOR_TLS_KEY=%q\n' "$tls_key_path"
+        fi
+        if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
+            printf 'GPUHARBOR_TUNNEL_TOKEN=%q\n' "$GPUHARBOR_TUNNEL_TOKEN"
+        fi
+    } > "$env_file"
+    chmod 600 "$env_file"
+}
+
+valid_listener_host "$GPUHARBOR_HOST" \
+    || fatal "Invalid GPUHARBOR_HOST: ${GPUHARBOR_HOST}"
 
 # Sets GPUHARBOR_PORT (bind) and GPUHARBOR_EXTERNAL_PORT (advertise)
 detect_ports() {
@@ -102,6 +173,8 @@ detect_ports() {
         if [[ -n "${!var:-}" ]]; then
             if [[ "$internal" -gt 65535 ]]; then
                 debug "Port ${internal} exceeds 65535, skipping"
+            elif ! valid_port "${!var}"; then
+                debug "External port ${!var} is invalid, skipping"
             elif port_is_free "$internal"; then
                 GPUHARBOR_PORT="$internal"
                 GPUHARBOR_EXTERNAL_PORT="${!var}"
@@ -116,7 +189,10 @@ detect_ports() {
     # Try any Vast.ai mapped port that's free (skip invalid ports > 65535 and port 22)
     for var in $(compgen -v VAST_TCP_PORT_ 2>/dev/null || true); do
         local internal="${var#VAST_TCP_PORT_}"
-        if [[ "$internal" =~ ^[0-9]+$ ]] && [[ "$internal" -le 65535 ]] && [[ "$internal" -ne 22 ]] && port_is_free "$internal"; then
+        if valid_port "$internal" \
+            && valid_port "${!var}" \
+            && [[ "$internal" -ne 22 ]] \
+            && port_is_free "$internal"; then
             GPUHARBOR_PORT="$internal"
             GPUHARBOR_EXTERNAL_PORT="${!var}"
             info "Selected port ${internal} (internal) -> ${!var} (external)"
@@ -124,7 +200,11 @@ detect_ports() {
         fi
     done
 
-    # No Vast.ai — find a free port, external = internal
+    if $vastai_detected; then
+        fatal "No free, valid Vast.ai TCP mapping is available for the worker"
+    fi
+
+    # Non-Vast hosts use the same internal and external port.
     for port in 5000 8443 8000 9000 7000; do
         if port_is_free "$port"; then
             GPUHARBOR_PORT="$port"
@@ -139,11 +219,72 @@ detect_ports() {
     warn "All preferred ports in use, defaulting to 5000"
 }
 
+# Cloudflare connects to a fixed local origin; no Vast TCP mapping is needed.
+if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
+    GPUHARBOR_PORT="${GPUHARBOR_PORT:-5000}"
+    GPUHARBOR_EXTERNAL_PORT="$GPUHARBOR_PORT"
+    valid_port "$GPUHARBOR_PORT" || fatal "Invalid GPUHARBOR_PORT"
+else
+# If no explicit port was supplied, reuse the last installed endpoint without
+# probing it for availability: the verified incumbent worker is expected to
+# still be listening there until the controlled restart later in this script.
+if [[ -z "${GPUHARBOR_PORT:-}" && -r "$PREVIOUS_WORKER_ENV" ]]; then
+    PRIOR_PORT=$(read_worker_env_value GPUHARBOR_PORT || true)
+    PRIOR_EXTERNAL_PORT=$(read_worker_env_value GPUHARBOR_EXTERNAL_PORT || true)
+    if valid_port "$PRIOR_PORT"; then
+        if vastai_is_detected; then
+            if MAPPED_EXTERNAL=$(vast_external_port "$PRIOR_PORT"); then
+                GPUHARBOR_PORT="$PRIOR_PORT"
+                GPUHARBOR_EXTERNAL_PORT="$MAPPED_EXTERNAL"
+                info "Reusing established Vast.ai endpoint: ${GPUHARBOR_PORT} -> ${GPUHARBOR_EXTERNAL_PORT}"
+            else
+                fatal "Established port ${PRIOR_PORT} no longer has a Vast.ai TCP mapping"
+            fi
+        elif [[ -z "$PRIOR_EXTERNAL_PORT" ]] || valid_port "$PRIOR_EXTERNAL_PORT"; then
+            GPUHARBOR_PORT="$PRIOR_PORT"
+            GPUHARBOR_EXTERNAL_PORT="${PRIOR_EXTERNAL_PORT:-$PRIOR_PORT}"
+            info "Reusing established endpoint: ${GPUHARBOR_PORT}"
+        else
+            warn "Ignoring invalid prior external port: ${PRIOR_EXTERNAL_PORT}"
+        fi
+    else
+        warn "Ignoring invalid prior bind port: ${PRIOR_PORT:-missing}"
+    fi
+fi
+
 if [[ -z "${GPUHARBOR_PORT:-}" ]]; then
     detect_ports
 else
-    GPUHARBOR_EXTERNAL_PORT="${GPUHARBOR_EXTERNAL_PORT:-$GPUHARBOR_PORT}"
-    info "Using configured port: ${GPUHARBOR_PORT}"
+    valid_port "$GPUHARBOR_PORT" || fatal "Invalid GPUHARBOR_PORT: ${GPUHARBOR_PORT}"
+    if vastai_is_detected; then
+        MAPPED_EXTERNAL=$(vast_external_port "$GPUHARBOR_PORT") \
+            || fatal "Port ${GPUHARBOR_PORT} has no valid Vast.ai TCP mapping"
+        GPUHARBOR_EXTERNAL_PORT="$MAPPED_EXTERNAL"
+    else
+        GPUHARBOR_EXTERNAL_PORT="${GPUHARBOR_EXTERNAL_PORT:-$GPUHARBOR_PORT}"
+        valid_port "$GPUHARBOR_EXTERNAL_PORT" \
+            || fatal "Invalid GPUHARBOR_EXTERNAL_PORT: ${GPUHARBOR_EXTERNAL_PORT}"
+    fi
+    info "Using configured port: ${GPUHARBOR_PORT} (external: ${GPUHARBOR_EXTERNAL_PORT})"
+fi
+
+fi
+
+if [[ "${GPUHARBOR_RENDER_ENV_ONLY:-0}" == "1" ]]; then
+    RENDERED_ENV="${GPUHARBOR_STORAGE_ROOT}/worker.env"
+    render_worker_env \
+        "$RENDERED_ENV" \
+        "${GPUHARBOR_SERVER_NAME:-gpuharbor-worker}" \
+        "${GPUHARBOR_AUTH_TOKEN:-ghb_tok_installer_test}" \
+        "${CONTAINER_ID:-}" \
+        "" \
+        ""
+    echo "GPUHARBOR_WORKER_ENV=${RENDERED_ENV}"
+    exit 0
+elif [[ "${GPUHARBOR_PORT_SELECTION_ONLY:-0}" == "1" ]]; then
+    echo "GPUHARBOR_PORT=${GPUHARBOR_PORT}"
+    echo "GPUHARBOR_EXTERNAL_PORT=${GPUHARBOR_EXTERNAL_PORT}"
+    exit 0
 fi
 
 # ── Detect Vast.ai instance ID ───────────────────────────────────────
@@ -166,9 +307,7 @@ DISK_FREE_KB=$(df /workspace 2>/dev/null | awk 'NR==2 {print $4}' || df / | awk 
 DISK_FREE_GB=$(( DISK_FREE_KB / 1024 / 1024 ))
 if [[ "$DISK_FREE_GB" -lt 5 ]]; then
     warn "Only ${DISK_FREE_GB}GB free disk space."
-    read -p "Continue anyway? [y/N] " -n 1 -r
-    echo
-    [[ $REPLY =~ ^[Yy]$ ]] || exit 1
+    fatal "At least 5 GiB free disk is required for installation"
 fi
 
 # ── Step 1: Verify GPU ─────────────────────────────────────────────────
@@ -238,16 +377,20 @@ fi
 success "Using Python: $($PYTHON --version)"
 
 # Create venv under /workspace so it persists across Vast.ai stops
-VENV_DIR="/workspace/gpuharbor_venv"
+VENV_DIR="${GPUHARBOR_WORKER_VENV:-/workspace/gpuharbor_venv}"
 if [[ ! -d "$VENV_DIR" ]]; then
     $PYTHON -m venv "$VENV_DIR"
 fi
 
 VENV_PIP="${VENV_DIR}/bin/pip"
 
-if [[ -d "${SCRIPT_DIR}/gpuharbor" ]]; then
+if [[ "${GPUHARBOR_PREINSTALLED:-0}" == "1" ]]; then
+    "${VENV_DIR}/bin/python" -c 'import gpuharbor, supervisor; assert gpuharbor.__version__ == "0.2.0"'
+    info "Using worker baked into the image"
+elif [[ -d "${SCRIPT_DIR}/gpuharbor" ]]; then
     info "Installing from local source..."
-    "$VENV_PIP" install -q "${SCRIPT_DIR}"
+    "$VENV_PIP" install -q --require-hashes -r "${SCRIPT_DIR}/requirements.lock"
+    "$VENV_PIP" install -q --no-deps "${SCRIPT_DIR}"
 else
     info "Installing gpuharbor package..."
     "$VENV_PIP" install -q gpuharbor-worker
@@ -270,7 +413,14 @@ if [[ -n "${GPUHARBOR_AUTH_TOKEN:-}" ]]; then
     success "Using pre-configured auth token"
 elif [[ -f "$TOKEN_FILE" ]]; then
     AUTH_TOKEN=$(cat "$TOKEN_FILE")
-    success "Using existing auth token"
+    if [[ -n "${AUTH_TOKEN//[[:space:]]/}" ]]; then
+        success "Using existing auth token"
+    else
+        AUTH_TOKEN=$("${VENV_DIR}/bin/python" -c "from gpuharbor.common.auth import generate_token; print(generate_token())")
+        echo "$AUTH_TOKEN" > "$TOKEN_FILE"
+        chmod 600 "$TOKEN_FILE"
+        success "Replaced empty auth token"
+    fi
 else
     AUTH_TOKEN=$("${VENV_DIR}/bin/python" -c "from gpuharbor.common.auth import generate_token; print(generate_token())")
     echo "$AUTH_TOKEN" > "$TOKEN_FILE"
@@ -320,7 +470,10 @@ fi
 info "Step 5/5: Starting worker on port ${GPUHARBOR_PORT}..."
 
 PUBLIC_IP=$(curl -s --max-time 5 https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
-HOSTNAME_LABEL=$(hostname -s 2>/dev/null || echo "gpuharbor-worker")
+HOSTNAME_LABEL="${GPUHARBOR_SERVER_NAME:-$(hostname -s 2>/dev/null || echo gpuharbor-worker)}"
+GPUHARBOR_WORKER_REPO="$SCRIPT_DIR"
+GPUHARBOR_WORKER_VENV="$VENV_DIR"
+GPUHARBOR_CACHE_ROOT="${GPUHARBOR_CACHE_ROOT:-/workspace/gpuharbor-cache}"
 
 PROTOCOL="http"
 if [[ "$GPUHARBOR_TLS" != "none" ]]; then
@@ -329,307 +482,50 @@ fi
 
 # Write environment file
 ENV_FILE="${GPUHARBOR_STORAGE_ROOT}/worker.env"
-cat > "$ENV_FILE" << ENVEOF
-GPUHARBOR_SERVER_NAME=${HOSTNAME_LABEL}
-GPUHARBOR_AUTH_TOKEN=${AUTH_TOKEN}
-GPUHARBOR_PORT=${GPUHARBOR_PORT}
-GPUHARBOR_DB_PATH=${GPUHARBOR_STORAGE_ROOT}/jobs.db
-GPUHARBOR_STORAGE_ROOT=${GPUHARBOR_STORAGE_ROOT}
-GPUHARBOR_LOG_LEVEL=${GPUHARBOR_LOG_LEVEL}
-GPUHARBOR_VAST_INSTANCE_ID=${VAST_INSTANCE_ID}
-ENVEOF
-
-if [[ -n "$TLS_CERT_PATH" ]]; then
-    echo "GPUHARBOR_TLS_CERT=${TLS_CERT_PATH}" >> "$ENV_FILE"
-    echo "GPUHARBOR_TLS_KEY=${TLS_KEY_PATH}" >> "$ENV_FILE"
-fi
-
-if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
-    echo "GPUHARBOR_TUNNEL_TOKEN=${GPUHARBOR_TUNNEL_TOKEN}" >> "$ENV_FILE"
-fi
-
-chmod 600 "$ENV_FILE"
+render_worker_env \
+    "$ENV_FILE" \
+    "$HOSTNAME_LABEL" \
+    "$AUTH_TOKEN" \
+    "$VAST_INSTANCE_ID" \
+    "$TLS_CERT_PATH" \
+    "$TLS_KEY_PATH"
 
 WORKER_BIN="${VENV_DIR}/bin/gpuharbor-worker"
 
-# Gracefully stop existing worker (job processes continue in their own sessions)
-if [[ -f "${GPUHARBOR_STORAGE_ROOT}/worker.pid" ]]; then
-    OLD_PID=$(cat "${GPUHARBOR_STORAGE_ROOT}/worker.pid")
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        info "Stopping existing worker (PID: ${OLD_PID})... running jobs will continue"
-        kill "$OLD_PID"
-        for i in $(seq 1 10); do
-            kill -0 "$OLD_PID" 2>/dev/null || break
-            sleep 1
-        done
-        if kill -0 "$OLD_PID" 2>/dev/null; then
-            warn "Worker didn't stop gracefully, force killing..."
-            kill -9 "$OLD_PID" 2>/dev/null || true
-            sleep 1
-        fi
-    fi
-else
-    # Fallback for first install or missing PID file
-    pkill -f "gpuharbor-worker" 2>/dev/null || true
-    sleep 1
-fi
-
-# Start worker with nohup (works everywhere — systemd or not)
-set -a; source "$ENV_FILE"; set +a
-nohup "$WORKER_BIN" > "${GPUHARBOR_STORAGE_ROOT}/worker.log" 2>&1 &
-WORKER_PID=$!
-echo "$WORKER_PID" > "${GPUHARBOR_STORAGE_ROOT}/worker.pid"
-
-# ── Verify worker is running and healthy ──────────────────────────────
-
-info "Waiting for worker to start..."
-HEALTH_URL="${PROTOCOL}://localhost:${GPUHARBOR_PORT}/health"
-CURL_OPTS="-s --max-time 2"
-if [[ "$PROTOCOL" == "https" ]]; then
-    CURL_OPTS="$CURL_OPTS --insecure"
-fi
-
-HEALTHY=false
-for i in 1 2 3 4 5; do
-    sleep 1
-    if ! kill -0 "$WORKER_PID" 2>/dev/null; then
-        error "Worker process died (PID: ${WORKER_PID})"
-        echo ""
-        error "=== Worker log ==="
-        tail -30 "${GPUHARBOR_STORAGE_ROOT}/worker.log" 2>/dev/null || true
-        echo ""
-        error "=== Environment ==="
-        cat "$ENV_FILE"
-        exit 1
-    fi
-
-    HEALTH_RESPONSE=$(curl $CURL_OPTS "$HEALTH_URL" 2>/dev/null || true)
-    if echo "$HEALTH_RESPONSE" | grep -q '"status"' 2>/dev/null; then
-        HEALTHY=true
-        break
-    fi
-    debug "Attempt ${i}/5: waiting for ${HEALTH_URL} ..."
-done
-
-if ! $HEALTHY; then
-    error "Worker started (PID: ${WORKER_PID}) but health check failed after 5 attempts"
-    echo ""
-    error "Health URL tested: ${HEALTH_URL}"
-    error "=== Worker log ==="
-    tail -30 "${GPUHARBOR_STORAGE_ROOT}/worker.log" 2>/dev/null || true
-    echo ""
-    error "=== Environment ==="
-    cat "$ENV_FILE"
-    echo ""
-    error "=== Listening ports ==="
-    ss -tlnp 2>/dev/null | grep "$WORKER_PID" || ss -tlnp 2>/dev/null | head -20
-    exit 1
-fi
-
-success "Worker started and healthy (PID: ${WORKER_PID})"
-debug "Health check response: ${HEALTH_RESPONSE}"
-
-# ── Step 6: Start Cloudflare tunnel (if token provided) ──────────────
-
-TUNNEL_URL=""
+# Install a pinned, verified cloudflared binary for tunnel deployments.
 if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
-    info "Step 6/6: Starting Cloudflare tunnel..."
-
-    # Install cloudflared if not present
-    if ! command -v cloudflared &>/dev/null; then
-        info "Installing cloudflared..."
-        ARCH=$(uname -m)
-        case "$ARCH" in
-            x86_64|amd64) CF_ARCH="amd64" ;;
-            aarch64|arm64) CF_ARCH="arm64" ;;
-            *) fatal "Unsupported architecture: $ARCH" ;;
-        esac
-        curl -sL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CF_ARCH}" -o /usr/local/bin/cloudflared
-        chmod +x /usr/local/bin/cloudflared
-        success "cloudflared installed"
-    else
-        success "cloudflared already installed"
+    CF_VERSION="2026.9.3"
+    case "$(uname -m)" in
+        x86_64|amd64) CF_ARCH=amd64; CF_SHA=77e26d8d900e0b8469f416239d14b5f296525fdf79fee6f511ef55609e3fbac2 ;;
+        aarch64|arm64) CF_ARCH=arm64; CF_SHA=aaeb2d7d0da3614634c7e03ab13487a1522c2e79165ed2929cfe23d5e95b326d ;;
+        *) fatal "Unsupported architecture" ;;
+    esac
+    if ! command -v cloudflared >/dev/null || ! cloudflared --version | grep -q "$CF_VERSION"; then
+        CF_TEMP=$(mktemp)
+        trap 'rm -f "$CF_TEMP"' EXIT
+        curl -fsSL --retry 3 "https://github.com/cloudflare/cloudflared/releases/download/${CF_VERSION}/cloudflared-linux-${CF_ARCH}" -o "$CF_TEMP"
+        printf '%s  %s\n' "$CF_SHA" "$CF_TEMP" | sha256sum -c -
+        install -m 755 "$CF_TEMP" /usr/local/bin/cloudflared
+        rm -f "$CF_TEMP"
+        trap - EXIT
     fi
+fi
 
-    # Stop existing tunnel process
-    if [[ -f "${GPUHARBOR_STORAGE_ROOT}/tunnel.pid" ]]; then
-        OLD_TUNNEL_PID=$(cat "${GPUHARBOR_STORAGE_ROOT}/tunnel.pid")
-        if kill -0 "$OLD_TUNNEL_PID" 2>/dev/null; then
-            info "Stopping existing tunnel (PID: ${OLD_TUNNEL_PID})..."
-            kill "$OLD_TUNNEL_PID" 2>/dev/null || true
-            sleep 2
-            kill -9 "$OLD_TUNNEL_PID" 2>/dev/null || true
-        fi
-    fi
+# All entry points share the same Supervisor lifecycle. Worker restarts do
+# not signal training process groups. Container reboot runs vast/onstart.sh.
+RESTART="${GPUHARBOR_STORAGE_ROOT}/restart.sh"
+{
+    printf '#!/usr/bin/env bash\nset -euo pipefail\n'
+    printf 'exec %q -m gpuharbor.worker.service restart --root %q "$@"\n' "${VENV_DIR}/bin/python" "$GPUHARBOR_STORAGE_ROOT"
+} > "$RESTART"
+chmod 700 "$RESTART"
 
-    # Start tunnel
-    nohup cloudflared tunnel run --token "$GPUHARBOR_TUNNEL_TOKEN" \
-        > "${GPUHARBOR_STORAGE_ROOT}/tunnel.log" 2>&1 &
-    TUNNEL_PID=$!
-    echo "$TUNNEL_PID" > "${GPUHARBOR_STORAGE_ROOT}/tunnel.pid"
-
-    # Wait briefly and verify cloudflared is still running
-    sleep 3
-    if kill -0 "$TUNNEL_PID" 2>/dev/null; then
-        success "Cloudflare tunnel started (PID: ${TUNNEL_PID})"
-        # Extract the hostname from the tunnel connector log
-        TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9._-]+\.[a-zA-Z]+' "${GPUHARBOR_STORAGE_ROOT}/tunnel.log" 2>/dev/null | head -1 || true)
-        if [[ -z "$TUNNEL_URL" ]]; then
-            # Tunnel is running but hostname not yet in logs — that's fine
-            info "Tunnel is running. Check 'tunnel.log' or Cloudflare dashboard for the hostname."
-        fi
-    else
-        error "Cloudflare tunnel failed to start. Check ${GPUHARBOR_STORAGE_ROOT}/tunnel.log"
-        tail -10 "${GPUHARBOR_STORAGE_ROOT}/tunnel.log" 2>/dev/null || true
-    fi
+if [[ "${GPUHARBOR_INSTALL_ONLY:-0}" != "1" ]]; then
+    "${VENV_DIR}/bin/python" -m gpuharbor.worker.service restart --root "$GPUHARBOR_STORAGE_ROOT"
+    success "Worker and tunnel supervised; authenticated endpoints verified"
 else
-    info "No GPUHARBOR_TUNNEL_TOKEN set — skipping Cloudflare tunnel."
-    info "Set GPUHARBOR_TUNNEL_TOKEN in .env for a persistent tunnel, or start a quick tunnel manually."
+    success "Worker installed; startup deferred"
 fi
-
-# Write restart helper
-cat > "${GPUHARBOR_STORAGE_ROOT}/restart.sh" << 'RESTARTEOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PID_FILE="$SCRIPT_DIR/worker.pid"
-TUNNEL_PID_FILE="$SCRIPT_DIR/tunnel.pid"
-REPO_DIR="${GPUHARBOR_WORKER_REPO:-/workspace/GPUHarborWorker}"
-VENV_DIR="${GPUHARBOR_WORKER_VENV:-/workspace/gpuharbor_venv}"
-UPDATE=0
-
-if [[ "${1:-}" == "--update" || "${GPUHARBOR_AUTO_UPDATE_ON_RESTART:-0}" == "1" ]]; then
-    UPDATE=1
-fi
-
-if [[ "$UPDATE" == "1" ]]; then
-    if [[ ! -d "$REPO_DIR/.git" ]]; then
-        echo "Cannot update: GPUHarborWorker git repo not found at $REPO_DIR" >&2
-        exit 1
-    fi
-    echo "Updating GPUHarborWorker in $REPO_DIR..."
-    git -C "$REPO_DIR" pull --ff-only
-    echo "Reinstalling worker package from local source..."
-    "$VENV_DIR/bin/pip" install -q "$REPO_DIR"
-fi
-
-# Gracefully stop worker (job processes continue in their own sessions)
-if [[ -f "$PID_FILE" ]]; then
-    OLD_PID=$(cat "$PID_FILE")
-    if kill -0 "$OLD_PID" 2>/dev/null; then
-        echo "Stopping worker (PID: $OLD_PID)... running jobs will continue"
-        kill "$OLD_PID"
-        for i in $(seq 1 10); do
-            kill -0 "$OLD_PID" 2>/dev/null || break
-            sleep 1
-        done
-        if kill -0 "$OLD_PID" 2>/dev/null; then
-            echo "Force killing worker..."
-            kill -9 "$OLD_PID" 2>/dev/null || true
-            sleep 1
-        fi
-    fi
-else
-    pkill -f "gpuharbor-worker" 2>/dev/null || true
-    sleep 1
-fi
-
-set -a; source "$SCRIPT_DIR/worker.env"; set +a
-
-nohup "$VENV_DIR/bin/gpuharbor-worker" > "$SCRIPT_DIR/worker.log" 2>&1 &
-echo $! > "$PID_FILE"
-echo "Worker restarted (PID: $!). Running jobs preserved."
-
-# Restart Cloudflare tunnel if token is configured
-if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
-    if [[ -f "$TUNNEL_PID_FILE" ]]; then
-        OLD_TUNNEL=$(cat "$TUNNEL_PID_FILE")
-        kill "$OLD_TUNNEL" 2>/dev/null || true
-        sleep 2
-    fi
-    nohup cloudflared tunnel run --token "$GPUHARBOR_TUNNEL_TOKEN" > "$SCRIPT_DIR/tunnel.log" 2>&1 &
-    echo $! > "$TUNNEL_PID_FILE"
-    echo "Tunnel restarted (PID: $!)."
-fi
-RESTARTEOF
-chmod +x "${GPUHARBOR_STORAGE_ROOT}/restart.sh"
-
-# ── Print connection info ──────────────────────────────────────────────
-
-DIRECT_URL="${PROTOCOL}://${PUBLIC_IP}:${GPUHARBOR_EXTERNAL_PORT}"
-LOCAL_URL="${PROTOCOL}://localhost:${GPUHARBOR_PORT}"
-DISK_FREE=$(df -BG /workspace 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G' || df -BG / | awk 'NR==2 {print $4}' | tr -d 'G')
-GPU_FIRST_NAME=$(echo "$GPU_INFO" | head -1 | cut -d, -f1 | xargs)
-
-echo ""
-echo -e "${BOLD}============================================${NC}"
-echo -e "${GREEN}  GPUHarbor worker ready!${NC}"
-echo -e "${BOLD}============================================${NC}"
-echo ""
-echo -e "  ${BOLD}Worker${NC}"
-echo -e "  Listening:  ${BOLD}${LOCAL_URL}${NC}  (bind port ${GPUHARBOR_PORT})"
-echo -e "  Direct URL: ${BOLD}${DIRECT_URL}${NC}  (external port ${GPUHARBOR_EXTERNAL_PORT})"
-echo -e "  Token:      ${BOLD}${AUTH_TOKEN}${NC}"
-echo ""
-echo -e "  ${BOLD}Hardware${NC}"
-echo -e "  GPU:   ${GPU_COUNT}x ${GPU_FIRST_NAME}"
-echo -e "  CUDA:  ${CUDA_VERSION}"
-echo -e "  Disk:  ${DISK_FREE}GB free"
-echo -e "  Store: ${GPUHARBOR_STORAGE_ROOT}"
-echo ""
-if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
-    echo -e "${BOLD}──── Tunnel ────${NC}"
-    echo ""
-    if [[ -n "$TUNNEL_URL" ]]; then
-        echo -e "  Tunnel URL: ${BOLD}${TUNNEL_URL}${NC}"
-    else
-        echo -e "  Tunnel:     ${BOLD}running${NC} (check Cloudflare dashboard for hostname)"
-    fi
-    echo -e "  Tunnel log: ${CYAN}tail -f ${GPUHARBOR_STORAGE_ROOT}/tunnel.log${NC}"
-    echo ""
-fi
-
-# When called from setup.sh (GPUHARBOR_QUIET_HINTS=1), skip Next Steps —
-# setup.sh prints its own with the complete gpuharbor servers add command.
-if [[ -z "${GPUHARBOR_QUIET_HINTS:-}" ]]; then
-    if [[ -n "${GPUHARBOR_TUNNEL_TOKEN:-}" ]]; then
-        echo -e "${BOLD}──── Next Steps ────${NC}"
-        echo ""
-        echo -e "  Add the server to ${CYAN}~/.gpuharbor/servers.yaml${NC} on your laptop (if not already):"
-        echo ""
-        echo -e "     ${CYAN}gpuharbor servers add ${HOSTNAME_LABEL} \\${NC}"
-        echo -e "     ${CYAN}    --url https://<your-tunnel-hostname> \\${NC}"
-        echo -e "     ${CYAN}    --token ${AUTH_TOKEN}${NC}"
-        echo ""
-        echo -e "  Test from your laptop:"
-        echo ""
-        echo -e "     ${CYAN}gpuharbor servers${NC}"
-    else
-        echo -e "${BOLD}──── Next Steps ────${NC}"
-        echo ""
-        echo -e "  ${BOLD}Option A: Named tunnel (recommended — permanent URL)${NC}"
-        echo ""
-        echo -e "  On your laptop, create a tunnel with:"
-        echo -e "     ${CYAN}./setup-tunnel.sh ${HOSTNAME_LABEL} gpuharbor.xyz${NC}"
-        echo ""
-        echo -e "  Then set GPUHARBOR_TUNNEL_TOKEN in .env and re-run install.sh."
-        echo ""
-        echo -e "  ${BOLD}Option B: Quick tunnel (temporary — expires ~24h)${NC}"
-        echo ""
-        echo -e "     ${CYAN}cloudflared tunnel --url ${LOCAL_URL}${NC}"
-        echo ""
-        echo -e "  Then add to ${CYAN}~/.gpuharbor/servers.yaml${NC} on your laptop:"
-        echo ""
-        echo -e "     ${CYAN}gpuharbor servers add ${HOSTNAME_LABEL} \\${NC}"
-        echo -e "     ${CYAN}    --url https://<tunnel-url>.trycloudflare.com \\${NC}"
-        echo -e "     ${CYAN}    --token ${AUTH_TOKEN}${NC}"
-    fi
-fi
-echo ""
-echo -e "${BOLD}──── Management ────${NC}"
-echo ""
-echo -e "  Logs:    ${CYAN}tail -f ${GPUHARBOR_STORAGE_ROOT}/worker.log${NC}"
-echo -e "  Restart: ${CYAN}bash ${GPUHARBOR_STORAGE_ROOT}/restart.sh${NC}"
-echo -e "  Health:  ${CYAN}curl ${LOCAL_URL}/health${NC}"
-echo ""
+info "Restart: ${RESTART}"
+info "Worker log: ${GPUHARBOR_STORAGE_ROOT}/worker.log"
+info "Preflight from your laptop: gpuharbor doctor --server ${HOSTNAME_LABEL}"

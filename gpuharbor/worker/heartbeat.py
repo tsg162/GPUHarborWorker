@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from typing import TYPE_CHECKING
 
 from gpuharbor.common.states import JobState, is_terminal
@@ -60,7 +59,7 @@ class HeartbeatMonitor:
             await asyncio.sleep(self._interval)
 
     async def _check_all_jobs(self) -> None:
-        """Check all running jobs whose PID is recorded in container_id field."""
+        """Check all running jobs against their complete process identity."""
         running_ids = self._store.get_running_job_ids()
         if not running_ids:
             return
@@ -70,52 +69,48 @@ class HeartbeatMonitor:
             if not job:
                 continue
 
-            pid_str = job.get("container_id")
-            if not pid_str:
+            # Skip jobs the executor is actively monitoring to avoid races.
+            if self._executor and self._executor.is_tracking(job_id):
                 continue
 
+            identity = (
+                self._executor.process_identity_from_job(job)
+                if self._executor
+                else None
+            )
+            if (
+                identity is None
+                or not self._executor
+                or not self._executor.execution_identity_is_valid(identity)
+            ):
+                pid = identity.pid if identity is not None else "unknown"
+                await self._mark_process_lost(job_id, pid)
+
+    async def _mark_process_lost(self, job_id: str, pid: int | str) -> None:
+        """Fail or finish cancellation when the stored identity is gone."""
+        # Process is gone or the PID now belongs to something else.
+        job = self._store.get_job(job_id)
+        if job and not is_terminal(JobState(job["state"])):
+            state = JobState(job["state"])
             try:
-                pid = int(pid_str)
-            except (ValueError, TypeError):
-                continue
-
-            await self._check_process(job_id, pid)
-
-    async def _check_process(self, job_id: str, pid: int) -> None:
-        """Check if a process is still alive by sending signal 0."""
-        # Skip jobs the executor is actively monitoring to avoid races
-        if self._executor and self._executor.is_tracking(job_id):
-            return
-
-        try:
-            os.kill(pid, 0)  # Doesn't actually send a signal, just checks existence
-        except ProcessLookupError:
-            # Process is gone -- mark job appropriately
-            job = self._store.get_job(job_id)
-            if job and not is_terminal(JobState(job["state"])):
-                state = JobState(job["state"])
-                try:
-                    if state == JobState.CANCEL_REQUESTED:
-                        # Cancel was in progress and process died -- treat as canceled
-                        self._store.update_state(job_id, JobState.CANCELED)
-                        logger.info(
-                            "Job %s: cancel completed (process %d exited)",
-                            job_id,
-                            pid,
-                        )
-                    else:
-                        error_msg = (
-                            f"Process {pid} not found "
-                            f"(may have been killed by OOM or external signal)"
-                        )
-                        logger.warning("Job %s: %s", job_id, error_msg)
-                        self._store.update_state(
-                            job_id,
-                            JobState.FAILED,
-                            error_message=error_msg,
-                        )
-                except (ValueError, KeyError):
-                    pass
-        except PermissionError:
-            # Process exists but we can't signal it (different user) -- it's alive
-            pass
+                if state == JobState.CANCEL_REQUESTED:
+                    # Cancel was in progress and process died -- treat as canceled
+                    self._store.update_state(job_id, JobState.CANCELED)
+                    logger.info(
+                        "Job %s: cancel completed (process %s exited)",
+                        job_id,
+                        pid,
+                    )
+                else:
+                    error_msg = (
+                        f"Stored process identity for PID {pid} is missing or "
+                        "no longer matches (process exited or PID was reused)"
+                    )
+                    logger.warning("Job %s: %s", job_id, error_msg)
+                    self._store.update_state(
+                        job_id,
+                        JobState.FAILED,
+                        error_message=error_msg,
+                    )
+            except (ValueError, KeyError):
+                pass

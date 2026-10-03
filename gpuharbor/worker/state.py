@@ -9,9 +9,9 @@ import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from gpuharbor.common.states import JobState, TERMINAL_STATES, validate_transition
+from gpuharbor.common.storage import validate_job_id
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     state         TEXT NOT NULL DEFAULT 'created',
     server_name   TEXT NOT NULL DEFAULT '',
     container_id  TEXT,
+    process_start_time TEXT,
+    process_pgid  INTEGER,
+    process_marker TEXT,
     created_at    TEXT NOT NULL,
     started_at    TEXT,
     completed_at  TEXT,
@@ -45,6 +48,15 @@ CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state);
 CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project);
 CREATE INDEX IF NOT EXISTS idx_artifacts_job_id ON artifacts(job_id);
 """
+
+_JOB_COLUMN_MIGRATIONS = {
+    "process_start_time": "TEXT",
+    "process_pgid": "INTEGER",
+    "process_marker": "TEXT",
+    "gpu_ids_json": "TEXT",
+    "backup_json": "TEXT",
+    "pinned": "INTEGER NOT NULL DEFAULT 0",
+}
 
 
 class JobStore:
@@ -69,6 +81,19 @@ class JobStore:
     def _init_db(self) -> None:
         conn = self._get_conn()
         conn.executescript(_SCHEMA)
+        existing_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        for column, column_type in _JOB_COLUMN_MIGRATIONS.items():
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {column_type}")
+        artifact_columns = {row["name"] for row in conn.execute("PRAGMA table_info(artifacts)")}
+        for column, kind in {"size": "INTEGER NOT NULL DEFAULT 0", "signature": "TEXT"}.items():
+            if column not in artifact_columns:
+                conn.execute(f"ALTER TABLE artifacts ADD COLUMN {column} {kind}")
+        conn.execute("UPDATE artifacts SET uri = 'jobs/' || job_id || '/' || uri WHERE uri LIKE 'checkpoints/%' OR uri LIKE 'output/%' OR uri LIKE 'logs/%'")
+        conn.execute("DELETE FROM artifacts WHERE rowid NOT IN (SELECT MAX(rowid) FROM artifacts GROUP BY job_id, uri)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_artifact_uri ON artifacts(job_id, uri)")
         conn.commit()
 
     def create_job(
@@ -82,6 +107,7 @@ class JobStore:
         """Insert a new job record. Returns the full job dict."""
         if job_id is None:
             job_id = f"job_{uuid.uuid4().hex[:8]}"
+        validate_job_id(job_id)
         now = datetime.now(timezone.utc).isoformat()
 
         conn = self._get_conn()
@@ -168,12 +194,36 @@ class JobStore:
         return self.get_job(job_id)  # type: ignore[return-value]
 
     def update_container_id(self, job_id: str, container_id: str) -> None:
-        """Set the Docker container ID for a running job."""
+        """Set the legacy process/container identifier for a running job."""
         conn = self._get_conn()
         conn.execute(
             "UPDATE jobs SET container_id = ? WHERE job_id = ?",
             (container_id, job_id),
         )
+        conn.commit()
+
+    def update_execution_identity(
+        self,
+        job_id: str,
+        *,
+        pid: int,
+        start_time: str,
+        pgid: int,
+        marker: str,
+    ) -> None:
+        """Atomically persist the Linux process identity used for recovery."""
+        conn = self._get_conn()
+        cursor = conn.execute(
+            """UPDATE jobs
+               SET container_id = ?,
+                   process_start_time = ?,
+                   process_pgid = ?,
+                   process_marker = ?
+               WHERE job_id = ?""",
+            (str(pid), start_time, pgid, marker, job_id),
+        )
+        if cursor.rowcount != 1:
+            raise KeyError(f"Job not found: {job_id}")
         conn.commit()
 
     def update_metrics(self, job_id: str, metrics: dict) -> None:
@@ -191,6 +241,8 @@ class JobStore:
         artifact_type: str,
         uri: str,
         sha256: str | None = None,
+        size: int = 0,
+        signature: str | None = None,
     ) -> dict:
         """Record an artifact for a job."""
         artifact_id = uuid.uuid4().hex[:12]
@@ -198,9 +250,11 @@ class JobStore:
 
         conn = self._get_conn()
         conn.execute(
-            """INSERT INTO artifacts (artifact_id, job_id, type, uri, sha256, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (artifact_id, job_id, artifact_type, uri, sha256, now),
+            """INSERT INTO artifacts (artifact_id, job_id, type, uri, sha256, created_at, size, signature)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(job_id, uri) DO UPDATE SET type=excluded.type,
+               sha256=excluded.sha256, size=excluded.size, signature=excluded.signature""",
+            (artifact_id, job_id, artifact_type, uri, sha256, now, size, signature),
         )
         conn.commit()
         logger.info("Artifact %s for job %s: %s", artifact_id, job_id, uri)
@@ -211,6 +265,7 @@ class JobStore:
             "uri": uri,
             "sha256": sha256,
             "created_at": now,
+            "size": size,
         }
 
     def get_artifacts(self, job_id: str) -> list[dict]:
@@ -230,6 +285,26 @@ class JobStore:
         ).fetchone()
         return dict(row) if row else None
 
+    def set_gpu_ids(self, job_id: str, gpu_ids: list[int]) -> None:
+        conn = self._get_conn()
+        conn.execute("UPDATE jobs SET gpu_ids_json=? WHERE job_id=?", (json.dumps(gpu_ids), job_id))
+        conn.commit()
+
+    def set_backup(self, job_id: str, receipt: dict) -> None:
+        conn = self._get_conn()
+        conn.execute("UPDATE jobs SET backup_json=? WHERE job_id=?", (json.dumps(receipt), job_id))
+        conn.commit()
+
+    def set_pinned(self, job_id: str, pinned: bool) -> None:
+        conn = self._get_conn()
+        conn.execute("UPDATE jobs SET pinned=? WHERE job_id=?", (int(pinned), job_id))
+        conn.commit()
+
+    def remove_artifacts(self, job_id: str, uris: list[str]) -> None:
+        conn = self._get_conn()
+        conn.executemany("DELETE FROM artifacts WHERE job_id=? AND uri=?", ((job_id, uri) for uri in uris))
+        conn.commit()
+
     def get_running_job_ids(self) -> list[str]:
         """Return IDs of all jobs in RUNNING, CHECKPOINTING, or CANCEL_REQUESTED state.
 
@@ -246,6 +321,21 @@ class JobStore:
             ),
         ).fetchall()
         return [r["job_id"] for r in rows]
+
+    def get_nonterminal_jobs(self) -> list[dict]:
+        """Return every job requiring deterministic startup reconciliation."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            """SELECT * FROM jobs
+               WHERE state NOT IN (?, ?, ?)
+               ORDER BY created_at""",
+            (
+                JobState.COMPLETED.value,
+                JobState.FAILED.value,
+                JobState.CANCELED.value,
+            ),
+        ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
 
     def count_active_jobs(self) -> int:
         """Count jobs that are not in a terminal state."""
@@ -296,4 +386,7 @@ class JobStore:
                 d["metrics"] = None
         else:
             d["metrics"] = None
+        d["gpu_ids"] = json.loads(d.get("gpu_ids_json") or "null")
+        d["backup"] = json.loads(d.get("backup_json") or "null")
+        d["pinned"] = bool(d.get("pinned"))
         return d

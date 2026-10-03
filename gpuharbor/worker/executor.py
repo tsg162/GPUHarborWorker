@@ -13,19 +13,37 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
-import shlex
+import json
 import shutil
+import uuid
+import os
+import secrets
+import shlex
 import signal
+from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import AsyncIterator
 
 from gpuharbor.common.job_spec import JobSpec
 from gpuharbor.common.states import JobState
 from gpuharbor.common.storage import LocalStorage, compute_sha256
 from gpuharbor.worker.state import JobStore
+from gpuharbor.worker.backup import BackupManager
+from gpuharbor.worker.archives import extract_archive
+from gpuharbor.worker.environment import prepare_environment
+from gpuharbor.worker.checkpoints import record_file, reconcile_artifacts
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ProcessIdentity:
+    """Durable identity for a Linux process across worker restarts."""
+
+    pid: int
+    start_time: str
+    pgid: int
+    marker: str
 
 
 class JobExecutor:
@@ -41,15 +59,21 @@ class JobExecutor:
         storage: LocalStorage,
         job_store: JobStore,
         default_grace_period: int = 30,
+        backup: BackupManager | None = None,
     ):
         self._storage = storage
         self._store = job_store
         self._grace_period = default_grace_period
+        self.backup = backup or BackupManager(storage, job_store)
+        self._gpu_lock = asyncio.Lock()
+        self._admission_lock = asyncio.Lock()
+        self._gpu_allocations: dict[str, list[int]] = {}
+        self._training_python: dict[str, str] = {}
 
         # Track running processes for cancel support
         self._processes: dict[str, asyncio.subprocess.Process] = {}
+        self._process_identities: dict[str, ProcessIdentity] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
-        self._log_queues: dict[str, asyncio.Queue] = {}
         # Jobs we are actively monitoring (for heartbeat coordination)
         self._monitored_jobs: set[str] = set()
 
@@ -67,18 +91,25 @@ class JobExecutor:
         self._monitored_jobs.add(job_id)
         cancel_event = asyncio.Event()
         self._cancel_events[job_id] = cancel_event
-        self._log_queues[job_id] = asyncio.Queue(maxsize=10000)
         process_started = False
 
         try:
-            self._validate_resources(job_id, spec)
+            await asyncio.to_thread(self._validate_resources, job_id, spec)
+            if job_id not in self._gpu_allocations:
+                await self.reserve_gpus(job_id, spec.resources.gpu_count)
+                self._store.set_gpu_ids(job_id, self._gpu_allocations[job_id])
             await self._prepare_workspace(job_id, spec)
             proc = await self._start_process(job_id, spec)
             process_started = True
 
             log_file = self._storage.job_log_file(job_id)
             cancelled = await self._monitor_process(
-                job_id, proc.pid, cancel_event, log_file, proc=proc
+                job_id,
+                proc.pid,
+                cancel_event,
+                log_file,
+                proc=proc,
+                identity=self._process_identities.get(job_id),
             )
 
             if cancelled:
@@ -91,7 +122,7 @@ class JobExecutor:
                     f"Last output:\n{tail}"
                 )
 
-            self._record_output_artifacts(job_id)
+            await asyncio.to_thread(self._record_output_artifacts, job_id)
             self._store.update_state(job_id, JobState.COMPLETED)
             logger.info("Job %s completed successfully", job_id)
 
@@ -120,11 +151,10 @@ class JobExecutor:
                 logger.error("Could not update job %s state to FAILED", job_id)
         finally:
             self._processes.pop(job_id, None)
+            self._process_identities.pop(job_id, None)
             self._cancel_events.pop(job_id, None)
             self._monitored_jobs.discard(job_id)
-            # Signal end of logs
-            if job_id in self._log_queues:
-                await self._log_queues[job_id].put(None)
+            await self._finalize_terminal(job_id)
 
     # ── Re-attach to running jobs after restart ────────────────────────
 
@@ -136,46 +166,74 @@ class JobExecutor:
 
         Returns a dict of {job_id: asyncio.Task} for the caller to track.
         """
-        running_ids = self._store.get_running_job_ids()
-        if not running_ids:
+        interrupted_jobs = self._store.get_nonterminal_jobs()
+        if not interrupted_jobs:
             return {}
 
         tasks: dict[str, asyncio.Task] = {}
 
-        for job_id in running_ids:
-            job = self._store.get_job(job_id)
-            if not job:
-                continue
+        for job in interrupted_jobs:
+            job_id = str(job["job_id"])
+            state = JobState(job["state"])
 
-            pid_str = job.get("container_id")
-            if not pid_str:
-                continue
-
-            try:
-                pid = int(pid_str)
-            except (ValueError, TypeError):
-                continue
-
-            if not self._is_pid_alive(pid):
-                logger.info(
-                    "Job %s process (PID %d) already dead, skipping reattach",
+            if state in {JobState.CREATED, JobState.UPLOADING_INPUTS}:
+                self._fail_interrupted_job(
                     job_id,
-                    pid,
+                    f"Worker restarted while job was in {state.value}; "
+                    "no process was durably started",
                 )
                 continue
 
-            state = job.get("state")
+            identity = self.process_identity_from_job(job)
+            exit_code = self._read_completed_execution(job_id, job)
+            if exit_code is not None and (identity is None or not self.execution_identity_is_valid(identity)):
+                if state == JobState.CHECKPOINTING:
+                    self._store.update_state(job_id, JobState.RUNNING)
+                await asyncio.to_thread(self._record_output_artifacts, job_id)
+                terminal = JobState.CANCELED if state == JobState.CANCEL_REQUESTED else (JobState.COMPLETED if exit_code == 0 else JobState.FAILED)
+                self._store.update_state(job_id, terminal, error_message=None if exit_code == 0 else f"Process exited with code {exit_code}")
+                await self._finalize_terminal(job_id)
+                continue
+            if identity is None:
+                self._fail_interrupted_job(
+                    job_id,
+                    "Worker restarted without a complete durable process identity",
+                )
+                continue
+            if not self.execution_identity_is_valid(identity):
+                self._fail_interrupted_job(
+                    job_id,
+                    "Stored process identity no longer matches the live process "
+                    "(process exited or PID was reused)",
+                )
+                continue
+
+            # Restore leases BEFORE accepting new jobs. Legacy jobs without
+            # assignments conservatively reserve every device.
+            from gpuharbor.worker.gpu import get_gpu_count
+            ids = job.get("gpu_ids")
+            if ids is None:
+                ids = list(range(await asyncio.to_thread(get_gpu_count)))
+            self._gpu_allocations[job_id] = ids
+            self._store.set_gpu_ids(job_id, ids)
 
             # If cancel was in progress when we restarted, resume it
-            if state == JobState.CANCEL_REQUESTED.value:
+            if state == JobState.CANCEL_REQUESTED:
                 logger.info(
-                    "Resuming cancellation of job %s (PID %d)", job_id, pid
+                    "Resuming cancellation of job %s (PID %d)",
+                    job_id,
+                    identity.pid,
                 )
-                task = asyncio.create_task(self._resume_cancel(job_id, pid))
+                task = asyncio.create_task(self._resume_cancel(job_id, identity))
                 tasks[job_id] = task
                 continue
 
-            logger.info("Re-attaching to job %s (PID %d)", job_id, pid)
+            if state == JobState.CHECKPOINTING:
+                self._store.update_state(job_id, JobState.RUNNING)
+
+            logger.info(
+                "Re-attaching to job %s (PID %d)", job_id, identity.pid
+            )
 
             # Restart checkpoint monitoring if enabled
             if checkpoint_mgr and job.get("spec"):
@@ -187,7 +245,7 @@ class JobExecutor:
                         keep_last_n=ckpt_cfg.get("keep_last_n", 3),
                     )
 
-            task = asyncio.create_task(self._reattach_job(job_id, pid))
+            task = asyncio.create_task(self._reattach_job(job_id, identity))
             tasks[job_id] = task
 
         if tasks:
@@ -195,19 +253,28 @@ class JobExecutor:
 
         return tasks
 
-    async def _reattach_job(self, job_id: str, pid: int) -> None:
+    async def _reattach_job(
+        self,
+        job_id: str,
+        identity: ProcessIdentity,
+    ) -> None:
         """Re-attach to a single running job process."""
         self._monitored_jobs.add(job_id)
+        self._process_identities[job_id] = identity
         cancel_event = asyncio.Event()
         self._cancel_events[job_id] = cancel_event
-        self._log_queues[job_id] = asyncio.Queue(maxsize=10000)
 
         log_file = self._storage.job_log_file(job_id)
         exit_code_file = self._storage.job_dir(job_id) / ".exitcode"
 
         try:
             cancelled = await self._monitor_process(
-                job_id, pid, cancel_event, log_file, proc=None
+                job_id,
+                identity.pid,
+                cancel_event,
+                log_file,
+                proc=None,
+                identity=identity,
             )
 
             if cancelled:
@@ -221,7 +288,7 @@ class JobExecutor:
                     break
                 await asyncio.sleep(0.5)
 
-            self._record_output_artifacts(job_id)
+            await asyncio.to_thread(self._record_output_artifacts, job_id)
 
             if exit_code is not None and exit_code == 0:
                 self._store.update_state(job_id, JobState.COMPLETED)
@@ -263,16 +330,21 @@ class JobExecutor:
             except (ValueError, KeyError):
                 pass
         finally:
+            self._process_identities.pop(job_id, None)
             self._cancel_events.pop(job_id, None)
             self._monitored_jobs.discard(job_id)
-            if job_id in self._log_queues:
-                await self._log_queues[job_id].put(None)
+            await self._finalize_terminal(job_id)
 
-    async def _resume_cancel(self, job_id: str, pid: int) -> None:
+    async def _resume_cancel(
+        self,
+        job_id: str,
+        identity: ProcessIdentity,
+    ) -> None:
         """Resume an interrupted cancellation after worker restart."""
         self._monitored_jobs.add(job_id)
+        self._process_identities[job_id] = identity
         try:
-            await self._handle_cancel_by_pid(job_id, pid)
+            await self._handle_cancel_by_identity(job_id, identity)
         except Exception as e:
             logger.exception(
                 "Error resuming cancel for job %s: %s", job_id, e
@@ -284,44 +356,74 @@ class JobExecutor:
             except (ValueError, KeyError):
                 pass
         finally:
+            self._process_identities.pop(job_id, None)
             self._monitored_jobs.discard(job_id)
+            await self._finalize_terminal(job_id)
 
     # ── Process lifecycle ──────────────────────────────────────────────
 
+    async def reserve_gpus(self, job_id: str, count: int) -> list[int]:
+        from gpuharbor.worker.gpu import get_gpu_count
+        total = await asyncio.to_thread(get_gpu_count)
+        async with self._gpu_lock:
+            if job_id in self._gpu_allocations:
+                return self._gpu_allocations[job_id]
+            occupied = {gpu for ids in self._gpu_allocations.values() for gpu in ids}
+            free = [i for i in range(total) if i not in occupied]
+            if len(free) < count:
+                raise ValueError(f"GPU busy: requested {count}, free {len(free)} of {total}. Retry when a job finishes.")
+            self._gpu_allocations[job_id] = free[:count]
+            return free[:count]
+
+    def release_gpus(self, job_id: str) -> None:
+        self._gpu_allocations.pop(job_id, None)
+
+    async def _finalize_terminal(self, job_id: str) -> None:
+        job = self._store.get_job(job_id)
+        if not job or job["state"] not in {"completed", "failed", "canceled"}:
+            return
+        self.release_gpus(job_id)
+        self._training_python.pop(job_id, None)
+        try:
+            await asyncio.to_thread(self._record_output_artifacts, job_id)
+            if self.backup.destination and job["spec"].get("backup", True):
+                await asyncio.to_thread(self.backup.snapshot, job_id)
+        except Exception as exc:
+            logger.exception("Artifact backup/finalization failed for %s", job_id)
+            receipt = (self._store.get_job(job_id) or {}).get("backup") or {}
+            self._store.set_backup(job_id, {**receipt, "last_error": str(exc)})
+
     def cleanup_terminal_job_dirs(
-        self,
-        *,
-        exclude_job_id: str | None = None,
-        project: str | None = None,
-        limit: int = 1000,
+        self, *, exclude_job_id: str | None = None, project: str | None = None,
+        limit: int = 1000, dry_run: bool = True, force: bool = False,
+        only_job_id: str | None = None,
     ) -> dict:
-        """Delete files for terminal jobs while preserving DB records."""
-        cleaned: list[dict] = []
+        """Explicit cleanup. Pinned jobs and unverified outputs stay protected."""
+        cleaned, skipped = [], []
         bytes_freed = 0
-        for job in self._store.list_terminal_jobs(project=project, limit=limit):
-            job_id = str(job["job_id"])
-            if exclude_job_id and job_id == exclude_job_id:
-                continue
-            freed = self._storage.cleanup_job(job_id)
-            if freed:
+        with self.backup._lock:
+            jobs = ([self._store.get_job(only_job_id)] if only_job_id else self._store.list_terminal_jobs(project=project, limit=limit))
+            for job in jobs:
+                if not job or job["job_id"] == exclude_job_id:
+                    continue
+                job_id = str(job["job_id"])
+                reason = None
+                if job["state"] not in {"completed", "failed", "canceled"}:
+                    reason = "job is active"
+                elif job.get("pinned"):
+                    reason = "job is pinned"
+                elif not force and not self.backup.covers_workspace(job_id):
+                    reason = "no matching verified terminal backup; back up first or explicitly force cleanup"
+                if reason:
+                    skipped.append({"job_id": job_id, "reason": reason})
+                    continue
+                freed = self._storage.path_size_bytes(self._storage.job_dir(job_id))
+                if not dry_run:
+                    freed = self._storage.cleanup_job(job_id)
+                    self._store.remove_artifacts(job_id, [a["uri"] for a in self._store.get_artifacts(job_id)])
                 bytes_freed += freed
-                cleaned.append(
-                    {
-                        "job_id": job_id,
-                        "state": job.get("state"),
-                        "project": job.get("project"),
-                        "bytes_freed": freed,
-                    }
-                )
-        return {
-            "cleaned": cleaned,
-            "cleaned_count": len(cleaned),
-            "project": project,
-            "limit": limit,
-            "bytes_freed": bytes_freed,
-            "gb_freed": round(bytes_freed / (1024**3), 3),
-            "disk_free_gb": self._storage.disk_free_gb(),
-        }
+                cleaned.append({"job_id": job_id, "state": job["state"], "project": job["project"], "bytes_freed": freed})
+        return {"dry_run": dry_run, "cleaned": cleaned, "skipped": skipped, "cleaned_count": len(cleaned), "project": project, "limit": limit, "bytes_freed": bytes_freed, "gb_freed": round(bytes_freed / 1024**3, 3), "disk_free_gb": self._storage.disk_free_gb()}
 
     def _validate_resources(self, job_id: str, spec: JobSpec) -> None:
         """Check that the server can satisfy the job's resource requirements."""
@@ -335,19 +437,6 @@ class JobExecutor:
 
         if spec.resources.disk_gb_min > 0:
             free_gb = self._storage.disk_free_gb()
-            if (
-                free_gb < spec.resources.disk_gb_min
-                and os.environ.get("GPUHARBOR_CLEANUP_ON_LOW_DISK", "1").lower()
-                not in {"0", "false", "no"}
-            ):
-                cleanup = self.cleanup_terminal_job_dirs(exclude_job_id=job_id)
-                logger.info(
-                    "Low disk cleanup before job %s: freed %.3f GB; disk_free_gb=%.1f",
-                    job_id,
-                    cleanup["gb_freed"],
-                    cleanup["disk_free_gb"],
-                )
-                free_gb = self._storage.disk_free_gb()
             if free_gb < spec.resources.disk_gb_min:
                 raise ValueError(
                     f"Job requires {spec.resources.disk_gb_min}GB free disk "
@@ -357,7 +446,32 @@ class JobExecutor:
     async def _prepare_workspace(self, job_id: str, spec: JobSpec) -> None:
         """Create workspace dirs and copy input artifacts into place."""
         self._store.update_state(job_id, JobState.UPLOADING_INPUTS)
-        self._storage.ensure_job_dirs(job_id)
+        await asyncio.to_thread(self._prepare_workspace_sync, job_id, spec)
+
+    def _prepare_workspace_sync(self, job_id: str, spec: JobSpec) -> None:
+        job_dir = self._storage.ensure_job_dirs(job_id)
+        project = job_dir / "project"
+        project.mkdir(exist_ok=True)
+        # A tiny stdlib-only helper is importable from any training interpreter.
+        from gpuharbor.common import training
+        runtime = job_dir / "runtime"
+        runtime.mkdir(exist_ok=True)
+        shutil.copyfile(training.__file__, runtime / "gpuharbor_training.py")
+        for filename, destination in [(spec.source_archive, project), (spec.resume_archive, job_dir / "input" / "resume")]:
+            if filename:
+                source = self._storage.get_file(f"uploads/{filename}")
+                if source is None:
+                    raise ValueError(f"Upload not found: {filename}")
+                extract_archive(source, destination, int(self._storage.disk_free_gb() * 1024**3))
+        cwd = (project / spec.work_dir).resolve()
+        cwd.relative_to(project.resolve())
+        if not cwd.is_dir():
+            raise ValueError(f"Working directory does not exist: {spec.work_dir}")
+        if spec.artifacts.dataset and not Path(spec.artifacts.dataset).is_dir():
+            raise ValueError(f"Dataset directory does not exist: {spec.artifacts.dataset}")
+        cache = Path(os.environ.get("GPUHARBOR_CACHE_ROOT", str(self._storage.root / "cache")))
+        cache.mkdir(parents=True, exist_ok=True)
+        self._training_python[job_id] = prepare_environment(spec.environment, project, cache)
 
         # Copy input checkpoint from uploads/ into job input/
         if spec.artifacts.input_checkpoint:
@@ -371,16 +485,16 @@ class JobExecutor:
                     f"Upload it first via POST /v1/upload"
                 )
             dest = self._storage.job_input_dir(job_id) / filename
-            if not dest.exists():
-                shutil.copy2(src, dest)
+            dest_existed = dest.exists()
+            if not dest_existed:
+                dest, _sha = self._storage.copy_to_job_input(job_id, src)
                 logger.info("Copied checkpoint %s -> %s", src, dest)
 
-            self._store.add_artifact(
-                job_id,
-                "input_checkpoint",
-                f"jobs/{job_id}/input/{filename}",
-                compute_sha256(dest),
-            )
+            # copy_to_job_input already computed this checksum.
+            sha = _sha if not dest_existed else compute_sha256(dest)
+            stat = dest.stat()
+            self._store.add_artifact(job_id, "input_checkpoint", f"jobs/{job_id}/input/{filename}", sha, stat.st_size,
+                                     f"{stat.st_size}:{stat.st_mtime_ns}:{stat.st_ctime_ns}")
 
     async def _start_process(
         self, job_id: str, spec: JobSpec
@@ -402,16 +516,24 @@ class JobExecutor:
         env["GPUHARBOR_INPUT_DIR"] = str(job_dir / "input")
         env["GPUHARBOR_OUTPUT_DIR"] = str(job_dir / "output")
         env["GPUHARBOR_CHECKPOINT_DIR"] = str(job_dir / "checkpoints")
+        execution_marker = secrets.token_hex(32)
+        env["GPUHARBOR_EXECUTION_ID"] = execution_marker
 
-        # Restrict visible GPUs if the job requests fewer than available
-        from gpuharbor.worker.gpu import get_gpu_count
-
-        total_gpus = get_gpu_count()
-        if 0 < spec.resources.gpu_count < total_gpus:
-            visible = ",".join(str(i) for i in range(spec.resources.gpu_count))
-            env["CUDA_VISIBLE_DEVICES"] = visible
-
-        cmd = spec.command
+        env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in self._gpu_allocations[job_id])
+        env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONPATH"] = str(job_dir / "runtime") + os.pathsep + env.get("PYTHONPATH", "")
+        cache = Path(os.environ.get("GPUHARBOR_CACHE_ROOT", str(self._storage.root / "cache")))
+        for key, folder in [("HF_HOME", "huggingface"), ("TORCH_HOME", "torch"), ("PIP_CACHE_DIR", "pip")]:
+            env.setdefault(key, str(cache / folder))
+        if spec.artifacts.dataset:
+            env["GPUHARBOR_DATASET_DIR"] = str(Path(spec.artifacts.dataset).resolve())
+        if spec.resume_archive:
+            env["GPUHARBOR_RESUME_DIR"] = str(job_dir / "input" / "resume")
+        python = self._training_python.get(job_id, spec.environment.python)
+        env["PATH"] = str(Path(python).parent) + os.pathsep + env.get("PATH", "")
+        cmd = list(spec.command)
+        if cmd[0] in {"python", "python3"}:
+            cmd[0] = python
         logger.info("Running job %s: %s", job_id, " ".join(cmd))
 
         log_file = self._storage.job_log_file(job_id)
@@ -419,10 +541,15 @@ class JobExecutor:
 
         # Wrap command to record exit code for crash recovery
         exit_code_file = job_dir / ".exitcode"
+        result_file = job_dir / ".execution-result.json"
+        result_tmp = job_dir / ".execution-result.json.tmp"
         wrapped_cmd = (
+            "trap ':' TERM INT\n"
             f"{shlex.join(cmd)}\n"
             f"_ec=$?\n"
             f"printf '%d' \"$_ec\" > {shlex.quote(str(exit_code_file))}\n"
+            f"printf '{{\"marker\":\"{execution_marker}\",\"exit_code\":%d}}' \"$_ec\" > {shlex.quote(str(result_tmp))}\n"
+            f"mv {shlex.quote(str(result_tmp))} {shlex.quote(str(result_file))}\n"
             f'exit "$_ec"'
         )
 
@@ -436,15 +563,38 @@ class JobExecutor:
                 stdout=log_fd,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
-                cwd=str(job_dir),
+                cwd=str(job_dir / "project" / spec.work_dir),
                 start_new_session=True,
             )
         finally:
             log_fd.close()
 
         self._processes[job_id] = proc
-        self._store.update_container_id(job_id, str(proc.pid))
-        logger.info("Started process PID %d for job %s", proc.pid, job_id)
+        identity = self._capture_process_identity(proc.pid, execution_marker)
+        if identity is not None:
+            self._process_identities[job_id] = identity
+            self._store.update_execution_identity(
+                job_id,
+                pid=identity.pid,
+                start_time=identity.start_time,
+                pgid=identity.pgid,
+                marker=identity.marker,
+            )
+            logger.info(
+                "Started process PID %d (start=%s, pgid=%d) for job %s",
+                identity.pid,
+                identity.start_time,
+                identity.pgid,
+                job_id,
+            )
+        else:
+            logger.warning(
+                "Could not capture durable identity for job %s PID %d; "
+                "the current worker can monitor it, but restart recovery will "
+                "fail the job safely",
+                job_id,
+                proc.pid,
+            )
 
         return proc
 
@@ -457,6 +607,7 @@ class JobExecutor:
         cancel_event: asyncio.Event,
         log_file: Path,
         proc: asyncio.subprocess.Process | None = None,
+        identity: ProcessIdentity | None = None,
     ) -> bool:
         """Monitor a process (new or reattached).
 
@@ -465,82 +616,53 @@ class JobExecutor:
 
         Returns True if cancelled, False if the process exited on its own.
         """
-        log_queue = self._log_queues.get(job_id)
-        tail_stop = asyncio.Event()
-
-        async def _tail_log() -> None:
-            """Tail the log file and push new lines to the live queue."""
-            pos = 0
-            buffer = b""
-            while not tail_stop.is_set():
-                try:
-                    if log_file.exists():
-                        with open(log_file, "rb") as f:
-                            f.seek(pos)
-                            new_data = f.read()
-                        if new_data:
-                            pos += len(new_data)
-                            buffer += new_data
-                            while b"\n" in buffer:
-                                line_bytes, buffer = buffer.split(b"\n", 1)
-                                line = line_bytes.decode(
-                                    "utf-8", errors="replace"
-                                )
-                                if log_queue:
-                                    try:
-                                        log_queue.put_nowait(line)
-                                    except asyncio.QueueFull:
-                                        try:
-                                            log_queue.get_nowait()
-                                        except asyncio.QueueEmpty:
-                                            pass
-                                        log_queue.put_nowait(line)
-                except (IOError, OSError):
-                    pass
-                await asyncio.sleep(0.3)
-
-            # Flush remaining partial line
-            if buffer and log_queue:
-                line = buffer.decode("utf-8", errors="replace").rstrip("\n")
-                if line:
-                    try:
-                        log_queue.put_nowait(line)
-                    except asyncio.QueueFull:
-                        pass
-
         async def _wait_for_exit() -> None:
             """Wait for the process to terminate."""
             if proc is not None:
                 await proc.wait()
             else:
-                # Reattached process: poll PID
+                # Reattached process: poll the full identity, not only its PID.
+                if identity is None:
+                    raise RuntimeError(
+                        f"Cannot monitor reattached job {job_id} without "
+                        "a durable process identity"
+                    )
                 while True:
-                    if not self._is_pid_alive(pid):
+                    if not self.execution_identity_is_valid(identity):
                         return
                     await asyncio.sleep(2)
 
         async def _watch_cancel() -> None:
             """Watch for a cancellation request."""
-            while not cancel_event.is_set():
-                await asyncio.sleep(1)
+            await cancel_event.wait()
             # Cancel requested
             if proc is not None:
-                await self._handle_cancel(job_id, proc)
+                await self._handle_cancel(job_id, proc, identity)
             else:
-                await self._handle_cancel_by_pid(job_id, pid)
+                if identity is None:
+                    raise RuntimeError(
+                        f"Cannot cancel reattached job {job_id} without "
+                        "a durable process identity"
+                    )
+                await self._handle_cancel_by_identity(job_id, identity)
 
-        tail_task = asyncio.create_task(_tail_log())
         exit_task = asyncio.create_task(_wait_for_exit())
         cancel_task = asyncio.create_task(_watch_cancel())
 
         try:
-            await asyncio.wait(
+            done, _pending = await asyncio.wait(
                 [exit_task, cancel_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            for completed_task in done:
+                completed_task.result()
 
+            # The event may be set just after the process exits but before the
+            # cancel watcher runs. Only report cancellation when its handler
+            # actually completed and set a terminal state.
+            if cancel_event.is_set() and cancel_task not in done:
+                await cancel_task
             cancelled = cancel_event.is_set()
-            tail_stop.set()
 
             if not cancelled:
                 # Give a moment for final log writes to flush to disk
@@ -548,8 +670,7 @@ class JobExecutor:
 
             return cancelled
         finally:
-            tail_stop.set()
-            for t in [tail_task, exit_task, cancel_task]:
+            for t in [exit_task, cancel_task]:
                 t.cancel()
                 try:
                     await t
@@ -559,7 +680,10 @@ class JobExecutor:
     # ── Cancellation ───────────────────────────────────────────────────
 
     async def _handle_cancel(
-        self, job_id: str, proc: asyncio.subprocess.Process
+        self,
+        job_id: str,
+        proc: asyncio.subprocess.Process,
+        identity: ProcessIdentity | None,
     ) -> None:
         """Gracefully cancel a running process (with Process handle)."""
         logger.info(
@@ -573,8 +697,17 @@ class JobExecutor:
         except (ValueError, KeyError):
             pass
 
-        # SIGTERM to process group (bash wrapper + child command)
-        self._signal_process_group(proc.pid, signal.SIGTERM)
+        if proc.returncode is not None:
+            await asyncio.to_thread(self._record_output_artifacts, job_id)
+            self._store.update_state(job_id, JobState.CANCELED)
+            return
+        if identity is None or not self._signal_process_group(
+            identity, signal.SIGTERM
+        ):
+            raise RuntimeError(
+                f"Refusing to signal job {job_id}: durable process identity "
+                "is missing or no longer matches"
+            )
 
         # Wait for grace period
         try:
@@ -582,22 +715,30 @@ class JobExecutor:
         except asyncio.TimeoutError:
             # Force kill
             logger.warning("Force-killing process group for job %s", job_id)
-            self._signal_process_group(proc.pid, signal.SIGKILL)
+            if not self._signal_process_group(identity, signal.SIGKILL):
+                raise RuntimeError(
+                    f"Refusing to force-kill job {job_id}: durable process "
+                    "identity no longer matches"
+                )
             try:
                 await proc.wait()
             except Exception:
                 pass
 
-        self._record_output_artifacts(job_id)
+        await asyncio.to_thread(self._record_output_artifacts, job_id)
         self._store.update_state(job_id, JobState.CANCELED)
         logger.info("Job %s canceled", job_id)
 
-    async def _handle_cancel_by_pid(self, job_id: str, pid: int) -> None:
-        """Cancel a process by PID (for reattached jobs without Process handle)."""
+    async def _handle_cancel_by_identity(
+        self,
+        job_id: str,
+        identity: ProcessIdentity,
+    ) -> None:
+        """Cancel a reattached process only while its full identity matches."""
         logger.info(
             "Cancelling reattached job %s PID %d (grace period: %ds)",
             job_id,
-            pid,
+            identity.pid,
             self._grace_period,
         )
 
@@ -606,12 +747,15 @@ class JobExecutor:
         except (ValueError, KeyError):
             pass
 
-        # SIGTERM to process group
-        self._signal_process_group(pid, signal.SIGTERM)
+        if not self._signal_process_group(identity, signal.SIGTERM):
+            raise RuntimeError(
+                f"Refusing to signal reattached job {job_id}: stored process "
+                "identity no longer matches"
+            )
 
         # Poll until dead or timeout
         for _ in range(self._grace_period * 2):  # check every 0.5s
-            if not self._is_pid_alive(pid):
+            if not self.execution_identity_is_valid(identity):
                 break
             await asyncio.sleep(0.5)
         else:
@@ -619,10 +763,14 @@ class JobExecutor:
             logger.warning(
                 "Force-killing process group for reattached job %s", job_id
             )
-            self._signal_process_group(pid, signal.SIGKILL)
+            if not self._signal_process_group(identity, signal.SIGKILL):
+                raise RuntimeError(
+                    f"Refusing to force-kill reattached job {job_id}: stored "
+                    "process identity no longer matches"
+                )
             await asyncio.sleep(1)
 
-        self._record_output_artifacts(job_id)
+        await asyncio.to_thread(self._record_output_artifacts, job_id)
         self._store.update_state(job_id, JobState.CANCELED)
         logger.info("Reattached job %s canceled", job_id)
 
@@ -637,57 +785,83 @@ class JobExecutor:
     # ── Output artifacts ───────────────────────────────────────────────
 
     def _record_output_artifacts(self, job_id: str) -> None:
-        """Scan output and checkpoint dirs and record artifacts in the store."""
-        for subdir, default_type in [
-            ("output", "final_model"),
-            ("checkpoints", "checkpoint"),
-        ]:
-            files = self._storage.list_job_files(job_id, subdir)
-            for f in files:
-                abs_path = self._storage.job_dir(job_id) / f["path"]
-                sha = compute_sha256(abs_path) if abs_path.exists() else None
-                artifact_type = default_type
-                name_lower = f["name"].lower()
-                if "log" in name_lower or name_lower.endswith(
-                    (".log", ".txt")
-                ):
-                    artifact_type = "training_log"
-                elif "config" in name_lower or name_lower.endswith(
-                    (".yaml", ".yml", ".json")
-                ):
-                    artifact_type = "config"
+        with self.backup._lock:
+            for subdir, kind in [("output", "final_model"), ("checkpoints", "checkpoint"), ("logs", "training_log")]:
+                for entry in self._storage.list_job_files(job_id, subdir):
+                    path = self._storage.get_file(f"jobs/{job_id}/{entry['path']}")
+                    if path is not None:
+                        record_file(self._storage, self._store, job_id, path, kind)
+            reconcile_artifacts(self._storage, self._store, job_id)
 
-                self._store.add_artifact(
-                    job_id, artifact_type, f"jobs/{job_id}/{f['path']}", sha
-                )
-
+    async def stream_logs(self, job_id: str, offset: int = 0, tail: int = 0, with_offsets: bool = False) -> AsyncIterator[str]:
+        """Independent bounded file cursor for every follower; no competing consumers."""
         log_file = self._storage.job_log_file(job_id)
-        if log_file.exists():
-            self._store.add_artifact(
-                job_id,
-                "training_log",
-                f"jobs/{job_id}/logs/container.log",
-                compute_sha256(log_file),
-            )
-
-    # ── Log streaming ──────────────────────────────────────────────────
-
-    async def stream_logs(self, job_id: str) -> AsyncIterator[str]:
-        """Yield log lines for a job."""
-        queue = self._log_queues.get(job_id)
-        if queue is None:
-            log_file = self._storage.job_log_file(job_id)
-            if log_file.exists():
-                with open(log_file) as f:
-                    for line in f:
-                        yield line.rstrip("\n")
-            return
-
+        position = offset
+        pending = b""
+        if tail and offset == 0 and log_file.exists():
+            position = await asyncio.to_thread(self._tail_offset, log_file, tail)
         while True:
-            line = await queue.get()
-            if line is None:
-                break
-            yield line
+            def read_chunk():
+                if not log_file.exists():
+                    return b""
+                with log_file.open("rb") as source:
+                    source.seek(position)
+                    return source.read(64 * 1024)
+            chunk = await asyncio.to_thread(read_chunk)
+            position += len(chunk)
+            pending += chunk
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                yield (line.decode("utf-8", errors="replace"), position - len(pending)) if with_offsets else line.decode("utf-8", errors="replace")
+            # Bound memory for very long lines (e.g. progress bars).
+            if len(pending) >= 64 * 1024:
+                yield (pending.decode("utf-8", errors="replace"), position) if with_offsets else pending.decode("utf-8", errors="replace")
+                pending = b""
+            job = self._store.get_job(job_id)
+            if not chunk and (not job or job["state"] in {"completed", "failed", "canceled"}):
+                if pending:
+                    yield (pending.decode("utf-8", errors="replace"), position) if with_offsets else pending.decode("utf-8", errors="replace")
+                return
+            if not chunk:
+                await asyncio.sleep(0.3)
+
+    @staticmethod
+    def _tail_offset(path: Path, count: int) -> int:
+        # Scan backwards in fixed blocks, including files with a single huge
+        # line. Never accumulate an entire log just to locate its tail.
+        with path.open("rb") as source:
+            source.seek(0, 2)
+            position = source.tell()
+            if not position or count <= 0:
+                return 0
+            source.seek(position - 1)
+            remaining = count + (1 if source.read(1) == b"\n" else 0)
+            while position:
+                amount = min(position, 64 * 1024)
+                position -= amount
+                source.seek(position)
+                data = source.read(amount)
+                for index in range(len(data) - 1, -1, -1):
+                    if data[index] == 10:
+                        remaining -= 1
+                        if remaining == 0:
+                            return position + index + 1
+            return 0
+
+    def _read_completed_execution(self, job_id: str, job: dict) -> int | None:
+        result = self._storage.job_dir(job_id) / ".execution-result.json"
+        if result.exists():
+            try:
+                payload = json.loads(result.read_text())
+                if payload["marker"] == job.get("process_marker") and type(payload["exit_code"]) is int:
+                    return payload["exit_code"]
+            except (ValueError, KeyError, OSError):
+                pass
+            return None
+        # Older workers wrote only .exitcode, inside a unique job directory.
+        if job.get("process_marker"):
+            return self._read_exit_code(self._storage.job_dir(job_id) / ".exitcode")
+        return None
 
     def get_log_file_path(self, job_id: str) -> Path | None:
         log_file = self._storage.job_log_file(job_id)
@@ -696,23 +870,94 @@ class JobExecutor:
     # ── Helpers ────────────────────────────────────────────────────────
 
     @staticmethod
-    def _is_pid_alive(pid: int) -> bool:
-        """Check if a process is still alive."""
+    def _read_process_start_time(pid: int) -> str | None:
+        """Read Linux /proc start time (clock ticks since boot) for a PID."""
         try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True  # exists but different user
+            stat_text = Path(f"/proc/{pid}/stat").read_text()
+            fields_after_comm = stat_text.rsplit(")", 1)[1].split()
+            return fields_after_comm[19]
+        except (FileNotFoundError, IndexError, OSError):
+            return None
+
+    @classmethod
+    def _capture_process_identity(
+        cls,
+        pid: int,
+        expected_marker: str,
+    ) -> ProcessIdentity | None:
+        """Capture a process identity and verify the worker-owned marker."""
+        try:
+            start_time = cls._read_process_start_time(pid)
+            if start_time is None:
+                return None
+            pgid = os.getpgid(pid)
+            environ = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+            expected = f"GPUHARBOR_EXECUTION_ID={expected_marker}".encode()
+            if expected not in environ:
+                return None
+            return ProcessIdentity(
+                pid=pid,
+                start_time=start_time,
+                pgid=pgid,
+                marker=expected_marker,
+            )
+        except (ProcessLookupError, PermissionError, OSError):
+            return None
 
     @staticmethod
-    def _signal_process_group(pid: int, sig: int) -> None:
-        """Send a signal to an entire process group."""
+    def process_identity_from_job(job: dict) -> ProcessIdentity | None:
+        """Parse a complete persisted identity from a job record."""
+        values = (
+            job.get("container_id"),
+            job.get("process_start_time"),
+            job.get("process_pgid"),
+            job.get("process_marker"),
+        )
+        if any(value is None for value in values):
+            return None
         try:
-            os.killpg(os.getpgid(pid), sig)
+            pid = int(values[0])
+            start_time = str(values[1])
+            pgid = int(values[2])
+            marker = str(values[3])
+        except (TypeError, ValueError):
+            return None
+        if pid <= 0 or pgid <= 0 or not start_time or not marker:
+            return None
+        return ProcessIdentity(pid, start_time, pgid, marker)
+
+    @classmethod
+    def execution_identity_is_valid(cls, identity: ProcessIdentity) -> bool:
+        """Validate PID, start time, PGID, and marker against /proc."""
+        current = cls._capture_process_identity(identity.pid, identity.marker)
+        return current == identity
+
+    @classmethod
+    def _signal_process_group(
+        cls,
+        identity: ProcessIdentity,
+        sig: int,
+    ) -> bool:
+        """Signal the expected group only after revalidating process identity."""
+        if not cls.execution_identity_is_valid(identity):
+            return False
+        try:
+            os.killpg(identity.pgid, sig)
+            return True
         except (ProcessLookupError, PermissionError, OSError):
-            pass
+            return False
+
+    def _fail_interrupted_job(self, job_id: str, reason: str) -> None:
+        """Move an unrecoverable nonterminal record to FAILED."""
+        logger.warning("Failing interrupted job %s: %s", job_id, reason)
+        try:
+            self._store.update_state(
+                job_id,
+                JobState.FAILED,
+                error_message=reason,
+            )
+        except (KeyError, ValueError):
+            logger.exception("Could not reconcile interrupted job %s", job_id)
 
     @staticmethod
     def _read_exit_code(exit_code_file: Path) -> int | None:
@@ -730,6 +975,7 @@ class JobExecutor:
         if not log_file.exists():
             return ""
         with open(log_file, "rb") as f:
-            data = f.read()
+            f.seek(JobExecutor._tail_offset(log_file, n_lines))
+            data = f.read(128 * 1024)
             lines = data.decode("utf-8", errors="replace").splitlines()
             return "\n".join(lines[-n_lines:])

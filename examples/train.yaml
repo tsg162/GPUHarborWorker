@@ -1,0 +1,12 @@
+name: gpuharbor-smoke-training
+command: [python3, train.py, --steps, '100']
+environment:
+  python: /venv/main/bin/python
+resources:
+  gpu_count: 1
+  disk_gb_min: 2
+checkpointing:
+  enabled: true
+  save_every_minutes: 1
+  keep_last_n: 3
+backup: true

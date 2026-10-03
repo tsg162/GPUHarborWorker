@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import shutil
 from pathlib import Path
 
@@ -13,6 +14,51 @@ logger = logging.getLogger(__name__)
 _HASH_CHUNK_SIZE = 8 * 1024 * 1024
 
 DEFAULT_WORKSPACE = Path("/workspace/gpuharbor")
+
+_SAFE_FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,254}$")
+_SAFE_JOB_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+class StoragePathError(ValueError):
+    """Raised when an input path cannot be confined to managed storage."""
+
+
+def validate_filename(filename: str) -> str:
+    """Validate a single, portable upload filename."""
+    if (
+        not isinstance(filename, str)
+        or filename in {".", ".."}
+        or not _SAFE_FILENAME.fullmatch(filename)
+    ):
+        raise StoragePathError(
+            "Filename must be a single 1-255 character component containing "
+            "only letters, numbers, '.', '_', or '-'"
+        )
+    return filename
+
+
+def validate_job_id(job_id: str) -> str:
+    """Validate a job identifier before it is used in SQL or filesystem paths."""
+    if not isinstance(job_id, str) or not _SAFE_JOB_ID.fullmatch(job_id):
+        raise StoragePathError(
+            "Job ID must be 1-128 characters, start with a letter or number, "
+            "and contain only letters, numbers, '_' or '-'"
+        )
+    return job_id
+
+
+def validate_relative_path(relative_path: str) -> str:
+    """Reject absolute, empty, and traversal-bearing POSIX paths."""
+    if not isinstance(relative_path, str) or not relative_path:
+        raise StoragePathError("Path must be a non-empty relative path")
+    if "\x00" in relative_path or "\\" in relative_path:
+        raise StoragePathError("Path contains an invalid character")
+    path = Path(relative_path)
+    if path.is_absolute():
+        raise StoragePathError("Absolute paths are not allowed")
+    if any(part in {"", ".", ".."} for part in relative_path.split("/")):
+        raise StoragePathError("Path traversal components are not allowed")
+    return relative_path
 
 
 def compute_sha256(file_path: str | Path) -> str:
@@ -41,42 +87,109 @@ class LocalStorage:
     """
 
     def __init__(self, root: Path = DEFAULT_WORKSPACE):
-        self.root = root
-        self.root.mkdir(parents=True, exist_ok=True)
-        (self.root / "uploads").mkdir(exist_ok=True)
+        requested_root = Path(root).resolve(strict=False)
+        requested_root.mkdir(parents=True, exist_ok=True)
+        self.root = requested_root.resolve(strict=True)
+        uploads = self.root / "uploads"
+        uploads.mkdir(exist_ok=True)
+        self._require_confined(uploads, within=self.root)
+
+    def _require_confined(
+        self,
+        path: str | Path,
+        *,
+        within: str | Path | None = None,
+    ) -> Path:
+        """Resolve a path and require component-aware containment.
+
+        ``Path.relative_to`` prevents sibling-prefix bypasses and resolving the
+        candidate before the check prevents symlink escapes.
+        """
+        base = Path(within) if within is not None else self.root
+        if not base.is_absolute():
+            base = self.root / base
+        resolved_base = base.resolve(strict=False)
+        try:
+            resolved_base.relative_to(self.root)
+        except ValueError as exc:
+            raise StoragePathError(
+                f"Storage boundary escapes the configured root: {within}"
+            ) from exc
+
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = resolved_base / candidate
+        resolved = candidate.resolve(strict=False)
+        try:
+            resolved.relative_to(resolved_base)
+        except ValueError as exc:
+            raise StoragePathError(
+                f"Path escapes managed storage: {path}"
+            ) from exc
+        return resolved
+
+    def is_confined(
+        self,
+        path: str | Path,
+        *,
+        within: str | Path | None = None,
+    ) -> bool:
+        """Return whether a path resolves beneath the requested storage area."""
+        try:
+            self._require_confined(path, within=within)
+            return True
+        except (OSError, StoragePathError):
+            return False
 
     # ── Job workspace management ────────────────────────────────────────
 
     def job_dir(self, job_id: str) -> Path:
-        return self.root / "jobs" / job_id
+        validate_job_id(job_id)
+        expected = self.root / "jobs" / job_id
+        resolved = self._require_confined(expected)
+        # A job directory may never alias another job through a symlink.
+        if resolved != expected:
+            raise StoragePathError(f"Job directory contains a symlink: {job_id}")
+        return resolved
 
     def ensure_job_dirs(self, job_id: str) -> Path:
         """Create the full directory tree for a job. Returns the job root."""
         base = self.job_dir(job_id)
         for sub in ("input", "output", "checkpoints", "logs"):
-            (base / sub).mkdir(parents=True, exist_ok=True)
+            dest = self._require_confined(base / sub, within=base)
+            dest.mkdir(parents=True, exist_ok=True)
+            self._require_confined(dest, within=base)
         return base
 
     def job_input_dir(self, job_id: str) -> Path:
-        return self.job_dir(job_id) / "input"
+        base = self.job_dir(job_id)
+        return self._require_confined(base / "input", within=base)
 
     def job_output_dir(self, job_id: str) -> Path:
-        return self.job_dir(job_id) / "output"
+        base = self.job_dir(job_id)
+        return self._require_confined(base / "output", within=base)
 
     def job_checkpoint_dir(self, job_id: str) -> Path:
-        return self.job_dir(job_id) / "checkpoints"
+        base = self.job_dir(job_id)
+        return self._require_confined(base / "checkpoints", within=base)
 
     def job_log_dir(self, job_id: str) -> Path:
-        return self.job_dir(job_id) / "logs"
+        base = self.job_dir(job_id)
+        return self._require_confined(base / "logs", within=base)
 
     def job_log_file(self, job_id: str) -> Path:
-        return self.job_log_dir(job_id) / "container.log"
+        log_dir = self.job_log_dir(job_id)
+        return self._require_confined(log_dir / "container.log", within=log_dir)
 
     # ── File operations ─────────────────────────────────────────────────
 
     def store_bytes(self, dest: Path, data: bytes) -> str:
         """Write raw bytes to a path. Returns SHA-256 of the written data."""
+        dest = self._require_confined(dest)
         dest.parent.mkdir(parents=True, exist_ok=True)
+        # Re-check after directory creation in case an existing component was
+        # a symlink. The resolved path is the one that is opened.
+        dest = self._require_confined(dest)
         dest.write_bytes(data)
         sha = compute_sha256(dest)
         logger.info("Stored %d bytes -> %s (sha256:%s)", len(data), dest, sha[:16])
@@ -87,7 +200,9 @@ class LocalStorage:
 
         Returns (absolute_path, sha256).
         """
-        dest = self.root / "uploads" / filename
+        validate_filename(filename)
+        upload_dir = self._require_confined(self.root / "uploads")
+        dest = self._require_confined(upload_dir / filename, within=upload_dir)
         sha = self.store_bytes(dest, data)
         return dest, sha
 
@@ -96,7 +211,9 @@ class LocalStorage:
 
         Returns (absolute_path, sha256).
         """
-        dest = self.job_input_dir(job_id) / filename
+        validate_filename(filename)
+        input_dir = self.job_input_dir(job_id)
+        dest = self._require_confined(input_dir / filename, within=input_dir)
         sha = self.store_bytes(dest, data)
         return dest, sha
 
@@ -105,9 +222,15 @@ class LocalStorage:
 
         Returns (dest_path, sha256).
         """
-        dest = self.job_input_dir(job_id) / src.name
+        src = self._require_confined(src)
+        if not src.is_file():
+            raise FileNotFoundError(src)
+        validate_filename(src.name)
+        input_dir = self.job_input_dir(job_id)
+        dest = self._require_confined(input_dir / src.name, within=input_dir)
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
+        dest = self._require_confined(dest, within=input_dir)
         sha = compute_sha256(dest)
         return dest, sha
 
@@ -117,10 +240,11 @@ class LocalStorage:
         Returns the absolute path if it exists, None otherwise.
         Guards against path traversal.
         """
-        resolved = (self.root / relative_path).resolve()
-        # Prevent path traversal outside storage root
-        if not str(resolved).startswith(str(self.root.resolve())):
-            logger.warning("Path traversal attempt blocked: %s", relative_path)
+        try:
+            validate_relative_path(relative_path)
+            resolved = self._require_confined(self.root / relative_path)
+        except (OSError, StoragePathError):
+            logger.warning("Unsafe storage path blocked: %s", relative_path)
             return None
         return resolved if resolved.is_file() else None
 
@@ -129,22 +253,29 @@ class LocalStorage:
 
         Returns list of {name, path, size, sha256} dicts.
         """
-        base = self.job_dir(job_id)
+        job_base = self.job_dir(job_id)
+        base = job_base
         if subdir:
-            base = base / subdir
+            validate_relative_path(subdir)
+            base = self._require_confined(base / subdir, within=job_base)
 
         if not base.exists():
             return []
 
         results = []
         for path in sorted(base.rglob("*")):
-            if not path.is_file():
+            try:
+                safe_path = self._require_confined(path, within=job_base)
+            except (OSError, StoragePathError):
+                logger.warning("Symlink escape skipped while listing: %s", path)
                 continue
-            rel = path.relative_to(self.job_dir(job_id))
+            if not safe_path.is_file():
+                continue
+            rel = path.relative_to(job_base)
             results.append({
                 "name": path.name,
                 "path": str(rel),
-                "size": path.stat().st_size,
+                "size": safe_path.stat().st_size,
             })
         return results
 
@@ -153,31 +284,39 @@ class LocalStorage:
         upload_dir = self.root / "uploads"
         if not upload_dir.exists():
             return []
-        return [
-            {
-                "name": p.name,
-                "path": f"uploads/{p.name}",
-                "size": p.stat().st_size,
-            }
-            for p in sorted(upload_dir.iterdir())
-            if p.is_file()
-        ]
+        results = []
+        for path in sorted(upload_dir.iterdir()):
+            try:
+                safe_path = self._require_confined(path, within=upload_dir)
+            except (OSError, StoragePathError):
+                logger.warning("Symlink escape skipped while listing: %s", path)
+                continue
+            if not safe_path.is_file():
+                continue
+            results.append({
+                "name": path.name,
+                "path": f"uploads/{path.name}",
+                "size": safe_path.stat().st_size,
+            })
+        return results
 
     # ── Cleanup ─────────────────────────────────────────────────────────
 
     def path_size_bytes(self, path: Path) -> int:
         """Return the total size of a file or directory tree."""
+        path = self._require_confined(path)
         if not path.exists():
             return 0
         if path.is_file():
             return path.stat().st_size
         total = 0
         for child in path.rglob("*"):
-            if child.is_file():
-                try:
-                    total += child.stat().st_size
-                except OSError:
-                    continue
+            try:
+                safe_child = self._require_confined(child, within=path)
+                if safe_child.is_file():
+                    total += safe_child.stat().st_size
+            except (OSError, StoragePathError):
+                continue
         return total
 
     def cleanup_job(self, job_id: str) -> int:
@@ -185,10 +324,16 @@ class LocalStorage:
         job_dir = self.job_dir(job_id)
         if job_dir.exists():
             bytes_freed = self.path_size_bytes(job_dir)
-            shutil.rmtree(job_dir, ignore_errors=True)
+            # Resolve once more immediately before recursive deletion.
+            safe_job_dir = self._require_confined(job_dir)
+            if safe_job_dir != job_dir:
+                raise StoragePathError(
+                    f"Refusing to remove symlinked job directory: {job_id}"
+                )
+            shutil.rmtree(safe_job_dir)
             logger.info(
                 "Cleaned up job directory: %s (freed %.2f GB)",
-                job_dir,
+                safe_job_dir,
                 bytes_freed / (1024**3),
             )
             return bytes_freed
@@ -203,20 +348,14 @@ class LocalStorage:
         if not ckpt_dir.exists():
             return []
 
-        # Get all checkpoint files sorted by mtime (oldest first)
-        files = sorted(
-            (p for p in ckpt_dir.rglob("*") if p.is_file() and not p.name.startswith(".")),
-            key=lambda p: p.stat().st_mtime,
-        )
-
-        if len(files) <= keep_last_n:
-            return []
-
-        to_delete = files[: len(files) - keep_last_n]
-        for path in to_delete:
-            path.unlink(missing_ok=True)
-            logger.info("Pruned old checkpoint: %s", path.name)
-
+        # Only complete checkpoint directories are eligible. Unmarked work in
+        # progress and legacy loose files are never pruned automatically.
+        from gpuharbor.worker.checkpoints import completed_checkpoints
+        units = completed_checkpoints(self, job_id)
+        to_delete = units[:-keep_last_n] if keep_last_n > 0 else []
+        for folder in to_delete:
+            safe = self._require_confined(folder, within=ckpt_dir)
+            shutil.rmtree(safe)
         return to_delete
 
     def disk_free_gb(self) -> float:

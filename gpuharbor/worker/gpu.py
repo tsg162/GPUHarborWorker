@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import logging
 import shutil
+import threading
+import time
+from gpuharbor import __version__
 import subprocess
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, asdict
@@ -22,7 +25,21 @@ class GPUInfo:
     memory_used_gb: float
 
 
+_cache_lock = threading.Lock()
+_cache_time = 0.0
+_cache_gpus: list[GPUInfo] = []
+
+
 def get_gpu_info() -> list[GPUInfo]:
+    global _cache_time, _cache_gpus
+    with _cache_lock:
+        if time.monotonic() - _cache_time >= 3:
+            _cache_gpus = _query_gpu_info()
+            _cache_time = time.monotonic()
+        return list(_cache_gpus)
+
+
+def _query_gpu_info() -> list[GPUInfo]:
     """Query nvidia-smi for GPU details.
 
     Returns an empty list if nvidia-smi is not available or fails.
@@ -169,7 +186,7 @@ def get_full_status(
         "ram_used_gb": sys_info["ram_used_gb"],
         "disk_free_gb": sys_info["disk_free_gb"],
         "running_jobs": running_jobs,
-        "worker_version": "0.1.0",
+        "worker_version": __version__,
         "uptime_seconds": uptime_seconds,
     }
 

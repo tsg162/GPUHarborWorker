@@ -2,10 +2,24 @@ const express = require("express");
 const path = require("path");
 const http = require("http");
 const https = require("https");
+const crypto = require("crypto");
 
 const app = express();
 
 const DASHBOARD_PORT = parseInt(process.env.DASHBOARD_PORT || "5001", 10);
+const DASHBOARD_HOST = process.env.DASHBOARD_HOST || "127.0.0.1";
+const DASHBOARD_PASSWORD = process.env.GPUHARBOR_DASHBOARD_PASSWORD;
+if (!DASHBOARD_PASSWORD) {
+  throw new Error("Set GPUHARBOR_DASHBOARD_PASSWORD before starting the dashboard");
+}
+app.use((req, res, next) => {
+  if (req.path === "/api/health") return next();
+  const expected = Buffer.from("Basic " + Buffer.from("admin:" + DASHBOARD_PASSWORD).toString("base64"));
+  const supplied = Buffer.from(req.headers.authorization || "");
+  if (supplied.length === expected.length && crypto.timingSafeEqual(supplied, expected)) return next();
+  res.set("WWW-Authenticate", 'Basic realm="GPUHarbor", charset="UTF-8"');
+  return res.status(401).send("Authentication required");
+});
 const WORKER_URL = process.env.WORKER_URL || "http://localhost:5000";
 const AUTH_TOKEN = process.env.GPUHARBOR_AUTH_TOKEN || "";
 
@@ -13,7 +27,7 @@ const AUTH_TOKEN = process.env.GPUHARBOR_AUTH_TOKEN || "";
 if (!AUTH_TOKEN) {
   try {
     const fs = require("fs");
-    const envPath = path.resolve(__dirname, "../.env");
+    const envPath = path.join(process.env.GPUHARBOR_STORAGE_ROOT || "/workspace/gpuharbor", "worker.env");
     if (fs.existsSync(envPath)) {
       const envContent = fs.readFileSync(envPath, "utf-8");
       const match = envContent.match(
@@ -60,20 +74,31 @@ function proxyToWorker(req, res) {
     }
 
     let body = "";
-    proxyRes.on("data", (chunk) => (body += chunk));
+    proxyRes.on("data", (chunk) => {
+      body += chunk;
+      if (Buffer.byteLength(body) > 8 * 1024 * 1024) proxyRes.destroy(new Error("Response too large"));
+    });
+    proxyRes.on("error", () => { if (!res.headersSent) res.status(502).json({error: "Worker response interrupted"}); else res.destroy(); });
     proxyRes.on("end", () => {
       res.status(proxyRes.statusCode);
       res.set("Content-Type", "application/json");
-      res.send(body);
+      try {
+        const data = JSON.parse(body);
+        if (data.spec) data.spec.env = Object.fromEntries(Object.keys(data.spec.env || {}).map(key => [key, "[redacted]"]));
+        delete data.spec_json;
+        delete data.process_marker;
+        res.json(data);
+      } catch { res.send(body); }
     });
   });
 
   proxyReq.on("error", (err) => {
-    res.status(502).json({ error: "Worker unreachable", detail: err.message });
+    if (!res.headersSent) res.status(502).json({ error: "Worker unreachable", detail: err.message });
+    else res.destroy();
   });
 
   // Handle client disconnect for SSE
-  req.on("close", () => proxyReq.destroy());
+  res.on("close", () => proxyReq.destroy());
 }
 
 // API proxy routes
@@ -93,7 +118,7 @@ app.get("*", (_req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-app.listen(DASHBOARD_PORT, () => {
-  console.log(`GPUHarbor Dashboard running at http://localhost:${DASHBOARD_PORT}`);
+app.listen(DASHBOARD_PORT, DASHBOARD_HOST, () => {
+  console.log(`GPUHarbor Dashboard running at http://${DASHBOARD_HOST}:${DASHBOARD_PORT}`);
   console.log(`Proxying to worker at ${WORKER_URL}`);
 });
